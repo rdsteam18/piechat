@@ -1,0 +1,27 @@
+{
+  "name": "piechat",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "apps/backend",
+    "packages/contracts"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=@piechat/web",
+    "dev:backend": "npm run dev --workspace=@piechat/backend",
+    "build:web": "npm run build --workspace=@piechat/web",
+    "typecheck:backend": "npm run typecheck --workspace=@piechat/backend"
+  },
+  "engines": {
+    "node": "24.21.x",
+    "npm": "11.x"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "unrs-resolver@1.12.2": true
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.3"
+  }
+}
