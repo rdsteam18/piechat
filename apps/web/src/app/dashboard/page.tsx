@@ -63,6 +63,13 @@ export default function DashboardPage() {
       </p>
 
       <button
+        onClick={() => router.push("/profile")}
+        className="mt-6 mr-3 rounded-lg border px-5 py-3 font-medium hover:bg-gray-50"
+      >
+        Edit profile
+      </button>
+
+      <button
         onClick={handleLogout}
         className="mt-6 rounded-lg bg-black px-5 py-3 text-white"
       >
