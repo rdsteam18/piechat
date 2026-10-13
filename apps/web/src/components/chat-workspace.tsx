@@ -28,6 +28,13 @@ type Message = {
   deleted_at: string | null;
 };
 
+type ScheduledItem = {
+  id: string;
+  conversation_id: string;
+  content: string;
+  scheduledTime: number; // timestamp ms
+};
+
 export default function ChatWorkspace() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -39,6 +46,9 @@ export default function ChatWorkspace() {
   const [conversationMembers, setConversationMembers] = useState<
     Record<string, string[]>
   >({});
+  const [memberRoles, setMemberRoles] = useState<
+    Record<string, Record<string, string>>
+  >({});
   const [members, setMembers] = useState<Record<string, Profile>>({});
   const [filteredIds, setFilteredIds] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -48,31 +58,77 @@ export default function ChatWorkspace() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
 
-  // Step 12: In-memory client cache for instant switching
+  // Step 14: Group Management State
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [groupTitleDraft, setGroupTitleDraft] = useState("");
+  const [selectedFriendIds, setSelectedFriendIds] = useState<string[]>([]);
+  const [acceptedFriends, setAcceptedFriends] = useState<Profile[]>([]);
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
+  const [showAddMembers, setShowAddMembers] = useState(false);
+  const [groupActionLoading, setGroupActionLoading] = useState(false);
+
+  // Message Scheduling State
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [scheduledDate, setScheduledDate] = useState("");
+  const [scheduledItems, setScheduledItems] = useState<ScheduledItem[]>([]);
+
+  // Step 12: In-memory client cache
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
 
-  // Step 12: Realtime typing state
+  // Realtime typing
   const [typingUsers, setTypingUsers] = useState<
     Record<string, { username: string; expiresAt: number }>
   >({});
   const lastTypingBroadcastRef = useRef<number>(0);
   const typingChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
-  // Step 12: Rate limiting tracker (client protection)
+  // Rate limiting tracker
   const recentSendTimestampsRef = useRef<number[]>([]);
 
-  // Auto-scroll anchor
+  // Auto-scroll
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
+  // Fetch accepted friends for group creation
+  const loadFriends = useCallback(async (uid: string) => {
+    try {
+      const { data: rows, error: friendsError } = await supabase
+        .from("friendships")
+        .select("id, requester_id, addressee_id, status")
+        .or(`requester_id.eq.${uid},addressee_id.eq.${uid}`)
+        .eq("status", "accepted");
+
+      if (friendsError) throw friendsError;
+
+      const friendIds = (rows ?? []).map((r) =>
+        r.requester_id === uid ? r.addressee_id : r.requester_id
+      );
+
+      if (friendIds.length === 0) {
+        setAcceptedFriends([]);
+        return;
+      }
+
+      const { data: people, error: peopleError } = await supabase
+        .from("profiles")
+        .select("id, username, display_name, avatar_url")
+        .in("id", friendIds);
+
+      if (peopleError) throw peopleError;
+      setAcceptedFriends((people ?? []) as Profile[]);
+    } catch {
+      // Non-critical, graceful fallback
+    }
+  }, []);
+
   const loadConversations = useCallback(
     async (uid: string) => {
       const { data: memberships, error: membershipError } = await supabase
         .from("conversation_members")
-        .select("conversation_id")
+        .select("conversation_id, user_id, role")
         .eq("user_id", uid);
 
       if (membershipError) throw membershipError;
@@ -85,6 +141,7 @@ export default function ChatWorkspace() {
         setMessages([]);
         setMembers({});
         setConversationMembers({});
+        setMemberRoles({});
         return;
       }
 
@@ -99,7 +156,6 @@ export default function ChatWorkspace() {
       const list = (rows ?? []) as Conversation[];
       setConversations(list);
 
-      // Select from query param or keep previous or pick first
       setSelectedId((previous) => {
         if (
           initialConversationParam &&
@@ -114,27 +170,30 @@ export default function ChatWorkspace() {
 
       const { data: allMembers, error: membersError } = await supabase
         .from("conversation_members")
-        .select("conversation_id,user_id")
+        .select("conversation_id, user_id, role")
         .in("conversation_id", ids);
 
       if (membersError) throw membersError;
 
       const convMembersMap: Record<string, string[]> = {};
+      const convRolesMap: Record<string, Record<string, string>> = {};
+
       for (const m of allMembers ?? []) {
         if (!convMembersMap[m.conversation_id]) {
           convMembersMap[m.conversation_id] = [];
+          convRolesMap[m.conversation_id] = {};
         }
         convMembersMap[m.conversation_id].push(m.user_id);
+        convRolesMap[m.conversation_id][m.user_id] = m.role;
       }
       setConversationMembers(convMembersMap);
+      setMemberRoles(convRolesMap);
 
-      const userIds = [
-        ...new Set(
-          (allMembers ?? []).map((m) => m.user_id).filter((id) => id !== uid)
-        ),
+      const allUserIds = [
+        ...new Set((allMembers ?? []).map((m) => m.user_id)),
       ];
 
-      if (userIds.length === 0) {
+      if (allUserIds.length === 0) {
         setMembers({});
         return;
       }
@@ -142,7 +201,7 @@ export default function ChatWorkspace() {
       const { data: profiles, error: profilesError } = await supabase
         .from("profiles")
         .select("id,username,display_name,avatar_url")
-        .in("id", userIds);
+        .in("id", allUserIds);
 
       if (profilesError) throw profilesError;
 
@@ -162,12 +221,10 @@ export default function ChatWorkspace() {
         return;
       }
 
-      // 1. Show instantly from cache if present
       if (messagesCacheRef.current[conversationId]) {
         setMessages(messagesCacheRef.current[conversationId]);
       }
 
-      // 2. Fetch fresh from Supabase
       const { data, error: messageError } = await supabase
         .from("messages")
         .select(
@@ -187,7 +244,7 @@ export default function ChatWorkspace() {
     [scrollToBottom]
   );
 
-  // Initialize Auth & Workspace
+  // Initialize
   useEffect(() => {
     let active = true;
 
@@ -213,7 +270,10 @@ export default function ChatWorkspace() {
         if (!active) return;
 
         setProfile(ownProfile as Profile | null);
-        await loadConversations(data.user.id);
+        await Promise.all([
+          loadConversations(data.user.id),
+          loadFriends(data.user.id),
+        ]);
       } catch (e) {
         if (active) {
           setError(e instanceof Error ? e.message : "Could not load chats.");
@@ -228,9 +288,9 @@ export default function ChatWorkspace() {
     return () => {
       active = false;
     };
-  }, [loadConversations, router]);
+  }, [loadConversations, loadFriends, router]);
 
-  // Handle selected conversation change
+  // Selected conversation changed
   useEffect(() => {
     if (!selectedId) {
       setMessages([]);
@@ -257,7 +317,7 @@ export default function ChatWorkspace() {
     };
   }, [selectedId, loadMessages]);
 
-  // Realtime subscription: Messages + Typing Presence Broadcast
+  // Realtime subscription
   useEffect(() => {
     if (!selectedId || !userId) return;
 
@@ -269,7 +329,6 @@ export default function ChatWorkspace() {
           broadcast: { self: false },
         },
       })
-      // 1. Listen for new messages
       .on(
         "postgres_changes",
         {
@@ -289,7 +348,25 @@ export default function ChatWorkspace() {
           setTimeout(scrollToBottom, 50);
         }
       )
-      // 2. Listen for Realtime Typing broadcasts
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: `conversation_id=eq.${selectedId}`,
+        },
+        (payload) => {
+          const updatedMsg = payload.new as Message;
+          setMessages((current) => {
+            const next = current.map((m) =>
+              m.id === updatedMsg.id ? updatedMsg : m
+            );
+            messagesCacheRef.current[selectedId] = next;
+            return next;
+          });
+        }
+      )
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         if (!payload || payload.userId === userId) return;
         const typingSenderId = payload.userId as string;
@@ -307,7 +384,6 @@ export default function ChatWorkspace() {
 
     typingChannelRef.current = channel;
 
-    // Timer to expire old typing indicators
     const interval = setInterval(() => {
       const now = Date.now();
       setTypingUsers((current) => {
@@ -331,7 +407,40 @@ export default function ChatWorkspace() {
     };
   }, [selectedId, userId, scrollToBottom]);
 
-  // Broadcast typing to other members (throttled to once every 1200ms)
+  // Scheduled message dispatcher ticker
+  useEffect(() => {
+    if (scheduledItems.length === 0) return;
+
+    const timer = setInterval(async () => {
+      const now = Date.now();
+      const readyToSend = scheduledItems.filter((item) => item.scheduledTime <= now);
+
+      if (readyToSend.length === 0) return;
+
+      setScheduledItems((current) =>
+        current.filter((item) => item.scheduledTime > now)
+      );
+
+      for (const item of readyToSend) {
+        try {
+          await supabase.from("messages").insert({
+            conversation_id: item.conversation_id,
+            sender_id: userId,
+            message_type: "text",
+            content: item.content,
+          });
+          if (item.conversation_id === selectedId) {
+            await loadMessages(selectedId);
+          }
+        } catch {
+          // Scheduled item execution error
+        }
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [scheduledItems, userId, selectedId, loadMessages]);
+
   const broadcastTyping = useCallback(() => {
     if (!selectedId || !typingChannelRef.current) return;
     const now = Date.now();
@@ -348,7 +457,6 @@ export default function ChatWorkspace() {
     });
   }, [selectedId, userId, profile]);
 
-  // Handle composer change
   function handleDraftChange(value: string) {
     setDraft(value);
     if (value.trim()) {
@@ -356,7 +464,6 @@ export default function ChatWorkspace() {
     }
   }
 
-  // Rate Limiting Check: max 5 messages in 4 seconds, min 350ms cooldown
   function checkRateLimit(): boolean {
     const now = Date.now();
     const windowStart = now - 4000;
@@ -383,7 +490,6 @@ export default function ChatWorkspace() {
     const content = draft.trim();
     if (!content || !selectedId || !userId || sending) return;
 
-    // Step 12: Rate limiting validation
     if (!checkRateLimit()) return;
 
     setSending(true);
@@ -399,7 +505,6 @@ export default function ChatWorkspace() {
 
       if (insertError) throw insertError;
 
-      // Clear composer on successful send
       setDraft("");
       await loadMessages(selectedId);
     } catch (e) {
@@ -409,14 +514,147 @@ export default function ChatWorkspace() {
     }
   }
 
+  // Delete message action
+  async function handleDeleteMessage(messageId: string) {
+    setError("");
+    try {
+      const { error: updateError } = await supabase
+        .from("messages")
+        .update({ deleted_at: new Date().toISOString() })
+        .eq("id", messageId);
+
+      if (updateError) throw updateError;
+
+      setMessages((current) =>
+        current.map((m) =>
+          m.id === messageId ? { ...m, deleted_at: new Date().toISOString() } : m
+        )
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not delete message.");
+    }
+  }
+
+  // Schedule message handler
+  function handleScheduleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const content = draft.trim();
+    if (!content || !selectedId || !scheduledDate) return;
+
+    const timeMs = new Date(scheduledDate).getTime();
+    if (isNaN(timeMs) || timeMs <= Date.now()) {
+      setError("Please pick a future time to schedule.");
+      return;
+    }
+
+    setScheduledItems((prev) => [
+      ...prev,
+      {
+        id: Math.random().toString(36).substring(2, 9),
+        conversation_id: selectedId,
+        content,
+        scheduledTime: timeMs,
+      },
+    ]);
+
+    setDraft("");
+    setShowScheduleModal(false);
+    setScheduledDate("");
+  }
+
+  // Create Group RPC
+  async function handleCreateGroup(e: React.FormEvent) {
+    e.preventDefault();
+    const title = groupTitleDraft.trim();
+    if (!title) {
+      setError("Please enter a group name.");
+      return;
+    }
+    if (selectedFriendIds.length === 0) {
+      setError("Select at least one friend to add to the group.");
+      return;
+    }
+
+    setGroupActionLoading(true);
+    setError("");
+
+    try {
+      const { data: convId, error: rpcError } = await supabase.rpc(
+        "create_group_conversation",
+        {
+          group_title: title,
+          member_ids: selectedFriendIds,
+        }
+      );
+
+      if (rpcError) throw rpcError;
+
+      setShowCreateGroup(false);
+      setGroupTitleDraft("");
+      setSelectedFriendIds([]);
+
+      await loadConversations(userId);
+      if (convId) setSelectedId(convId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create group.");
+    } finally {
+      setGroupActionLoading(false);
+    }
+  }
+
+  // Add members to existing group
+  async function handleAddMembers(friendIds: string[]) {
+    if (!selectedId || friendIds.length === 0) return;
+    setGroupActionLoading(true);
+    try {
+      const { error: rpcError } = await supabase.rpc("add_group_members", {
+        p_conv_id: selectedId,
+        p_member_ids: friendIds,
+      });
+
+      if (rpcError) throw rpcError;
+
+      setShowAddMembers(false);
+      await loadConversations(userId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not add members.");
+    } finally {
+      setGroupActionLoading(false);
+    }
+  }
+
+  // Remove member / leave group
+  async function handleRemoveMember(targetUserId: string) {
+    if (!selectedId) return;
+    setGroupActionLoading(true);
+    try {
+      const { error: rpcError } = await supabase.rpc("remove_group_member", {
+        p_conv_id: selectedId,
+        p_target_user_id: targetUserId,
+      });
+
+      if (rpcError) throw rpcError;
+
+      if (targetUserId === userId) {
+        // User left the group
+        setShowGroupInfo(false);
+        setSelectedId("");
+      }
+      await loadConversations(userId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not remove member.");
+    } finally {
+      setGroupActionLoading(false);
+    }
+  }
+
   const selected = conversations.find((item) => item.id === selectedId);
 
   function conversationName(conversation: Conversation) {
     if (conversation.type === "group") {
-      return conversation.title || "Untitled group";
+      return conversation.title || "Group conversation";
     }
 
-    // Accurate direct-chat partner name
     const memberIds = conversationMembers[conversation.id] ?? [];
     const otherId = memberIds.find((id) => id !== userId);
     const otherMember = otherId ? members[otherId] : undefined;
@@ -430,6 +668,19 @@ export default function ChatWorkspace() {
     (u) => u.expiresAt > Date.now()
   );
 
+  const selectedConversationMemberIds = selected
+    ? conversationMembers[selected.id] ?? []
+    : [];
+
+  const isUserAdmin =
+    selected &&
+    memberRoles[selected.id] &&
+    memberRoles[selected.id][userId] === "admin";
+
+  const conversationScheduledItems = scheduledItems.filter(
+    (item) => item.conversation_id === selectedId
+  );
+
   if (loading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[var(--background)] text-[var(--muted)]">
@@ -441,7 +692,7 @@ export default function ChatWorkspace() {
   return (
     <main className="min-h-screen bg-[var(--background)] p-3 text-[var(--foreground)] sm:p-6">
       <div className="mx-auto flex h-[calc(100dvh-24px)] max-w-7xl overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] sm:h-[calc(100dvh-48px)]">
-        {/* Left Sidebar / Conversation List */}
+        {/* Left Sidebar */}
         <aside
           className={`${
             selectedId ? "hidden md:flex" : "flex"
@@ -450,28 +701,43 @@ export default function ChatWorkspace() {
           <div className="border-b border-[var(--border)] p-5">
             <div className="flex items-center justify-between">
               <span className="text-xl font-bold tracking-tight">PieChat</span>
-              <button
-                className="text-sm font-medium text-[var(--primary)] hover:underline"
-                onClick={() => router.push("/profile")}
-              >
-                Profile
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  className="text-sm font-medium text-[var(--primary)] hover:underline"
+                  onClick={() => router.push("/profile")}
+                >
+                  Profile
+                </button>
+              </div>
             </div>
             <p className="mt-2 truncate text-sm text-[var(--muted)]">
               {profile?.display_name || profile?.username || "Your account"}
             </p>
-            <input
-              aria-label="Search conversations"
-              placeholder="Search conversations"
-              className="mt-4 w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2.5 text-sm outline-none focus:border-[var(--primary)]"
-              onChange={(event) => {
-                const query = event.target.value.toLowerCase();
-                const visible = conversations.filter((conversation) =>
-                  conversationName(conversation).toLowerCase().includes(query)
-                );
-                setFilteredIds(visible.map((conversation) => conversation.id));
-              }}
-            />
+
+            <div className="mt-4 flex items-center gap-2">
+              <input
+                aria-label="Search conversations"
+                placeholder="Search conversations"
+                className="w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
+                onChange={(event) => {
+                  const query = event.target.value.toLowerCase();
+                  const visible = conversations.filter((conversation) =>
+                    conversationName(conversation).toLowerCase().includes(query)
+                  );
+                  setFilteredIds(visible.map((conversation) => conversation.id));
+                }}
+              />
+              <button
+                onClick={() => {
+                  setError("");
+                  setShowCreateGroup(true);
+                }}
+                title="Create Group"
+                className="button-primary shrink-0 px-3 py-2 text-xs"
+              >
+                + Group
+              </button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto p-2">
@@ -482,14 +748,22 @@ export default function ChatWorkspace() {
               <div className="px-3 py-5 text-center">
                 <p className="font-medium text-sm">No chats yet</p>
                 <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
-                  Find a friend to start a conversation.
+                  Find a friend or start a group to begin chatting.
                 </p>
-                <button
-                  onClick={() => router.push("/friends")}
-                  className="button-primary mt-4 text-xs"
-                >
-                  Find friends
-                </button>
+                <div className="mt-4 flex justify-center gap-2">
+                  <button
+                    onClick={() => router.push("/friends")}
+                    className="button-primary text-xs"
+                  >
+                    Find friends
+                  </button>
+                  <button
+                    onClick={() => setShowCreateGroup(true)}
+                    className="button-secondary text-xs"
+                  >
+                    + New Group
+                  </button>
+                </div>
               </div>
             ) : (
               conversations
@@ -508,7 +782,11 @@ export default function ChatWorkspace() {
                     }`}
                   >
                     <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
-                      {conversationName(conversation).slice(0, 1).toUpperCase()}
+                      {conversation.type === "group" ? (
+                        <span>👥</span>
+                      ) : (
+                        conversationName(conversation).slice(0, 1).toUpperCase()
+                      )}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-semibold">
@@ -516,7 +794,9 @@ export default function ChatWorkspace() {
                       </span>
                       <span className="block text-xs text-[var(--muted)]">
                         {conversation.type === "group"
-                          ? "Group"
+                          ? `Group (${
+                              conversationMembers[conversation.id]?.length || 0
+                            } members)`
                           : "Direct message"}
                       </span>
                     </span>
@@ -553,28 +833,53 @@ export default function ChatWorkspace() {
         >
           {selected ? (
             <>
-              <header className="flex min-h-[72px] items-center gap-3 border-b border-[var(--border)] px-4 sm:px-6">
-                <button
-                  onClick={() => setSelectedId("")}
-                  className="mr-1 text-sm font-medium text-[var(--primary)] md:hidden"
+              {/* Chat Header */}
+              <header className="flex min-h-[72px] items-center justify-between border-b border-[var(--border)] px-4 sm:px-6">
+                <div
+                  className="flex items-center gap-3 min-w-0 cursor-pointer"
+                  onClick={() => {
+                    if (selected.type === "group") setShowGroupInfo(true);
+                  }}
                 >
-                  ← Back
-                </button>
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
-                  {conversationName(selected).slice(0, 1).toUpperCase()}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedId("");
+                    }}
+                    className="mr-1 text-sm font-medium text-[var(--primary)] md:hidden"
+                  >
+                    ← Back
+                  </button>
+                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
+                    {selected.type === "group" ? (
+                      <span>👥</span>
+                    ) : (
+                      conversationName(selected).slice(0, 1).toUpperCase()
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <h1 className="truncate font-semibold">
+                      {conversationName(selected)}
+                    </h1>
+                    <p className="text-xs text-[var(--muted)]">
+                      {selected.type === "group"
+                        ? `${selectedConversationMemberIds.length} members • Click for details`
+                        : "Direct conversation"}
+                    </p>
+                  </div>
                 </div>
-                <div className="min-w-0">
-                  <h1 className="truncate font-semibold">
-                    {conversationName(selected)}
-                  </h1>
-                  <p className="text-xs text-[var(--muted)]">
-                    {selected.type === "group"
-                      ? "Group conversation"
-                      : "Direct conversation"}
-                  </p>
-                </div>
+
+                {selected.type === "group" && (
+                  <button
+                    onClick={() => setShowGroupInfo(true)}
+                    className="button-secondary text-xs px-2.5 py-1.5"
+                  >
+                    Group Info
+                  </button>
+                )}
               </header>
 
+              {/* Message History */}
               <div className="flex-1 space-y-3 overflow-y-auto p-4 sm:p-6">
                 {messages.length === 0 ? (
                   <div className="flex h-full min-h-48 flex-col items-center justify-center text-center">
@@ -586,36 +891,67 @@ export default function ChatWorkspace() {
                 ) : (
                   messages.map((message) => {
                     const mine = message.sender_id === userId;
+                    const senderProfile = members[message.sender_id];
+                    const senderName =
+                      senderProfile?.display_name ||
+                      senderProfile?.username ||
+                      "User";
+
                     return (
                       <div
                         key={message.id}
-                        className={`flex ${
+                        className={`group relative flex ${
                           mine ? "justify-end" : "justify-start"
                         }`}
                       >
                         <div
-                          className={`max-w-[85%] whitespace-pre-wrap break-words rounded-lg px-4 py-3 sm:max-w-[70%] ${
+                          className={`relative max-w-[85%] whitespace-pre-wrap break-words rounded-lg px-4 py-3 sm:max-w-[70%] ${
                             mine
                               ? "bg-[var(--primary)] text-white"
                               : "bg-[var(--background)]"
                           }`}
                         >
-                          {message.deleted_at
-                            ? "This message was deleted"
-                            : message.content || `[${message.message_type}]`}
-                          <p
-                            className={`mt-1 text-right text-[10px] ${
-                              mine ? "text-white/70" : "text-[var(--muted)]"
-                            }`}
-                          >
-                            {new Date(message.created_at).toLocaleTimeString(
-                              [],
-                              {
-                                hour: "2-digit",
-                                minute: "2-digit",
-                              }
+                          {/* Show sender name in group chats if not mine */}
+                          {!mine && selected.type === "group" && (
+                            <p className="mb-1 text-xs font-semibold text-[var(--primary)]">
+                              {senderName}
+                            </p>
+                          )}
+
+                          {message.deleted_at ? (
+                            <span className="italic text-xs opacity-75">
+                              This message was deleted
+                            </span>
+                          ) : (
+                            message.content || `[${message.message_type}]`
+                          )}
+
+                          <div className="mt-1 flex items-center justify-end gap-2">
+                            <span
+                              className={`text-[10px] ${
+                                mine ? "text-white/70" : "text-[var(--muted)]"
+                              }`}
+                            >
+                              {new Date(message.created_at).toLocaleTimeString(
+                                [],
+                                {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                }
+                              )}
+                            </span>
+
+                            {/* Delete message icon for own message */}
+                            {mine && !message.deleted_at && (
+                              <button
+                                onClick={() => void handleDeleteMessage(message.id)}
+                                title="Delete message"
+                                className="opacity-0 transition-opacity group-hover:opacity-100 text-[11px] text-white/80 hover:text-white"
+                              >
+                                🗑️
+                              </button>
                             )}
-                          </p>
+                          </div>
                         </div>
                       </div>
                     );
@@ -624,9 +960,32 @@ export default function ChatWorkspace() {
                 <div ref={messagesEndRef} />
               </div>
 
+              {/* Scheduled Messages Banner (if any pending) */}
+              {conversationScheduledItems.length > 0 && (
+                <div className="border-t border-[var(--border)] bg-[var(--primary-soft)] px-4 py-2 text-xs text-[var(--primary)]">
+                  <span className="font-semibold">
+                    {conversationScheduledItems.length} scheduled message(s) pending:
+                  </span>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    {conversationScheduledItems.map((item) => (
+                      <span
+                        key={item.id}
+                        className="rounded bg-white/70 px-2 py-0.5 text-[11px]"
+                      >
+                        &quot;{item.content.slice(0, 15)}...&quot; at{" "}
+                        {new Date(item.scheduledTime).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Realtime Typing Indicator */}
               {activeTypingList.length > 0 && (
-                <div className="flex items-center gap-2 px-4 py-1.5 text-xs text-[var(--muted)] transition-opacity animate-fade-in">
+                <div className="flex items-center gap-2 px-4 py-1.5 text-xs text-[var(--muted)]">
                   <div className="flex items-center gap-1">
                     <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)] [animation-delay:-0.3s]" />
                     <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)] [animation-delay:-0.15s]" />
@@ -645,6 +1004,7 @@ export default function ChatWorkspace() {
                 </p>
               )}
 
+              {/* Composer */}
               <form
                 onSubmit={sendMessage}
                 className="flex items-end gap-2 border-t border-[var(--border)] p-3 sm:p-4"
@@ -664,9 +1024,21 @@ export default function ChatWorkspace() {
                   aria-label="Message"
                   className="max-h-32 min-h-11 flex-1 resize-y rounded-md border border-[var(--border)] bg-transparent px-3 py-3 text-sm outline-none focus:border-[var(--primary)]"
                 />
+
+                {/* Schedule button */}
+                <button
+                  type="button"
+                  title="Schedule message"
+                  disabled={!draft.trim()}
+                  onClick={() => setShowScheduleModal(true)}
+                  className="button-secondary shrink-0 px-3 py-2.5 text-sm disabled:opacity-40"
+                >
+                  ⏰
+                </button>
+
                 <button
                   disabled={sending || !draft.trim()}
-                  className="button-primary disabled:opacity-50"
+                  className="button-primary shrink-0 disabled:opacity-50"
                 >
                   {sending ? "Sending…" : "Send"}
                 </button>
@@ -681,18 +1053,310 @@ export default function ChatWorkspace() {
                 Your conversations, all in one place.
               </h1>
               <p className="mt-3 max-w-sm text-sm leading-6 text-[var(--muted)]">
-                Select a conversation or find friends to start chatting.
+                Select a conversation, create a group, or find friends to start chatting.
               </p>
-              <button
-                className="button-primary mt-5"
-                onClick={() => router.push("/friends")}
-              >
-                Find friends
-              </button>
+              <div className="mt-5 flex gap-3">
+                <button
+                  className="button-primary"
+                  onClick={() => router.push("/friends")}
+                >
+                  Find friends
+                </button>
+                <button
+                  className="button-secondary"
+                  onClick={() => setShowCreateGroup(true)}
+                >
+                  + Create Group
+                </button>
+              </div>
             </div>
           )}
         </section>
       </div>
+
+      {/* 1. Modal: Create New Group */}
+      {showCreateGroup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
+            <h2 className="text-xl font-bold tracking-tight">Create Group</h2>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              Name your group and choose friends to add.
+            </p>
+
+            <form onSubmit={handleCreateGroup} className="mt-5 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  Group Name
+                </label>
+                <input
+                  required
+                  maxLength={60}
+                  value={groupTitleDraft}
+                  onChange={(e) => setGroupTitleDraft(e.target.value)}
+                  placeholder="e.g. Design Team, Family, Study Buddies"
+                  className="mt-1.5 w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  Select Friends ({selectedFriendIds.length} selected)
+                </label>
+                <div className="mt-2 max-h-48 overflow-y-auto space-y-2 rounded-md border border-[var(--border)] p-2">
+                  {acceptedFriends.length === 0 ? (
+                    <p className="p-2 text-xs text-[var(--muted)]">
+                      No accepted friends found. Add friends first to start a group!
+                    </p>
+                  ) : (
+                    acceptedFriends.map((friend) => {
+                      const isChecked = selectedFriendIds.includes(friend.id);
+                      return (
+                        <label
+                          key={friend.id}
+                          className="flex cursor-pointer items-center justify-between rounded p-2 text-sm transition hover:bg-[var(--background)]"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)]">
+                              {(friend.display_name || friend.username || "U")
+                                .slice(0, 1)
+                                .toUpperCase()}
+                            </span>
+                            <span>{friend.display_name || friend.username}</span>
+                          </div>
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => {
+                              setSelectedFriendIds((prev) =>
+                                isChecked
+                                  ? prev.filter((id) => id !== friend.id)
+                                  : [...prev, friend.id]
+                              );
+                            }}
+                            className="h-4 w-4 rounded accent-[var(--primary)]"
+                          />
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              {error && <p className="text-xs text-red-600">{error}</p>}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateGroup(false)}
+                  className="button-secondary text-sm"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={
+                    groupActionLoading ||
+                    !groupTitleDraft.trim() ||
+                    selectedFriendIds.length === 0
+                  }
+                  className="button-primary text-sm disabled:opacity-50"
+                >
+                  {groupActionLoading ? "Creating…" : "Create Group"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 2. Modal: Group Info & Management */}
+      {showGroupInfo && selected && selected.type === "group" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
+            <div className="flex items-center justify-between border-b border-[var(--border)] pb-3">
+              <div>
+                <h2 className="text-xl font-bold tracking-tight">
+                  {conversationName(selected)}
+                </h2>
+                <p className="text-xs text-[var(--muted)]">
+                  {selectedConversationMemberIds.length} members
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  setShowGroupInfo(false);
+                  setShowAddMembers(false);
+                }}
+                className="text-lg text-[var(--muted)] hover:text-[var(--foreground)]"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Members List */}
+            <div className="mt-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  Group Members
+                </span>
+                {isUserAdmin && (
+                  <button
+                    onClick={() => setShowAddMembers(!showAddMembers)}
+                    className="text-xs font-semibold text-[var(--primary)] hover:underline"
+                  >
+                    + Add Member
+                  </button>
+                )}
+              </div>
+
+              {/* Add member sub-view */}
+              {showAddMembers && (
+                <div className="mt-2 rounded-md border border-[var(--border)] p-2">
+                  <p className="text-xs text-[var(--muted)] mb-2">
+                    Select friends to add to this group:
+                  </p>
+                  {acceptedFriends.filter(
+                    (f) => !selectedConversationMemberIds.includes(f.id)
+                  ).length === 0 ? (
+                    <p className="text-xs text-[var(--muted)]">
+                      All your accepted friends are already in this group.
+                    </p>
+                  ) : (
+                    acceptedFriends
+                      .filter(
+                        (f) => !selectedConversationMemberIds.includes(f.id)
+                      )
+                      .map((friend) => (
+                        <div
+                          key={friend.id}
+                          className="flex items-center justify-between p-1 text-xs"
+                        >
+                          <span>{friend.display_name || friend.username}</span>
+                          <button
+                            onClick={() => void handleAddMembers([friend.id])}
+                            disabled={groupActionLoading}
+                            className="button-primary text-[11px] px-2 py-1"
+                          >
+                            Add
+                          </button>
+                        </div>
+                      ))
+                  )}
+                </div>
+              )}
+
+              <div className="mt-3 max-h-56 overflow-y-auto space-y-2">
+                {selectedConversationMemberIds.map((mId) => {
+                  const mProfile = members[mId];
+                  const role =
+                    memberRoles[selected.id]?.[mId] || "member";
+                  const isSelf = mId === userId;
+
+                  return (
+                    <div
+                      key={mId}
+                      className="flex items-center justify-between rounded p-2 text-sm hover:bg-[var(--background)]"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)]">
+                          {(mProfile?.display_name || mProfile?.username || "U")
+                            .slice(0, 1)
+                            .toUpperCase()}
+                        </span>
+                        <div>
+                          <p className="font-semibold text-xs leading-4">
+                            {mProfile?.display_name || mProfile?.username || "Member"}{" "}
+                            {isSelf && "(You)"}
+                          </p>
+                          <p className="text-[10px] text-[var(--muted)]">
+                            {role === "admin" ? "Admin" : "Member"}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Admin remove member button */}
+                      {isUserAdmin && !isSelf && (
+                        <button
+                          onClick={() => void handleRemoveMember(mId)}
+                          disabled={groupActionLoading}
+                          className="text-xs text-red-600 hover:underline"
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-between border-t border-[var(--border)] pt-4">
+              <button
+                onClick={() => void handleRemoveMember(userId)}
+                disabled={groupActionLoading}
+                className="text-xs font-medium text-red-600 hover:underline"
+              >
+                Leave Group
+              </button>
+              <button
+                onClick={() => setShowGroupInfo(false)}
+                className="button-secondary text-sm"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 3. Modal: Schedule Message */}
+      {showScheduleModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-sm rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
+            <h2 className="text-lg font-bold tracking-tight">Schedule Message</h2>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              Choose the date and time when this message should be sent automatically.
+            </p>
+
+            <form onSubmit={handleScheduleSubmit} className="mt-4 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  Send Time
+                </label>
+                <input
+                  type="datetime-local"
+                  required
+                  value={scheduledDate}
+                  onChange={(e) => setScheduledDate(e.target.value)}
+                  className="mt-1.5 w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
+                />
+              </div>
+
+              <div className="rounded bg-[var(--background)] p-3 text-xs text-[var(--muted)]">
+                <span className="font-semibold text-[var(--foreground)]">Message:</span>{" "}
+                &quot;{draft}&quot;
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowScheduleModal(false)}
+                  className="button-secondary text-sm"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={!scheduledDate}
+                  className="button-primary text-sm disabled:opacity-50"
+                >
+                  Schedule
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
