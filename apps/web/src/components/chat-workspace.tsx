@@ -1508,17 +1508,29 @@ export default function ChatWorkspace() {
                           {/* WhatsApp-style Hover Arrow / Trigger Dropdown */}
                           <div
                             className={`absolute top-1.5 ${
-                              mine ? "-left-7" : "-right-7"
-                            } z-20 hidden group-hover:flex`}
+                              mine ? "-left-8" : "-right-8"
+                            } z-30 ${
+                              openActionMenuMsgId === message.id
+                                ? "flex"
+                                : "hidden group-hover:flex"
+                            }`}
                           >
                             <MessageActionMenu
                               isOpen={openActionMenuMsgId === message.id}
+                              onToggle={() =>
+                                setOpenActionMenuMsgId((prev) =>
+                                  prev === message.id ? null : message.id
+                                )
+                              }
                               onClose={() => setOpenActionMenuMsgId(null)}
-                              onAction={(action) => handleMessageAction(action, message)}
+                              onAction={(action) =>
+                                handleMessageAction(action, message)
+                              }
                               canEdit={mine && !message.deleted_at}
                               canDelete={mine || isUserAdmin}
                               isStarred={isStarred}
                               isPinned={pinnedMessageId === message.id}
+                              align={mine ? "right" : "left"}
                             />
                           </div>
                         </div>
