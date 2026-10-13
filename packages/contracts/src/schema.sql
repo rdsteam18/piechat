@@ -432,3 +432,174 @@ $$;
 revoke all on function public.get_or_create_direct_conversation(uuid) from public, anon;
 grant execute on function public.get_or_create_direct_conversation(uuid) to authenticated;
 
+-- ========================================================
+-- PHASE 14: Secure Group Chat RPCs
+-- ========================================================
+
+-- 1. Create Group Conversation RPC
+create or replace function public.create_group_conversation(
+  group_title text,
+  member_ids uuid[]
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_conv_id uuid;
+  v_clean_title text;
+  v_member_id uuid;
+  v_valid_members uuid[];
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  v_clean_title := trim(group_title);
+  if length(v_clean_title) < 1 or length(v_clean_title) > 60 then
+    raise exception 'Group name must be between 1 and 60 characters';
+  end if;
+
+  -- Filter unique member IDs and exclude creator
+  select coalesce(array_agg(distinct m), '{}')
+  into v_valid_members
+  from unnest(member_ids) as m
+  where m <> v_user_id;
+
+  if coalesce(array_length(v_valid_members, 1), 0) < 1 then
+    raise exception 'Select at least one friend to create a group';
+  end if;
+
+  -- Validate friendship: every selected member must be an accepted friend with the creator
+  foreach v_member_id in array v_valid_members loop
+    if not exists (
+      select 1 from public.friendships
+      where status = 'accepted'
+        and (
+          (requester_id = v_user_id and addressee_id = v_member_id)
+          or (requester_id = v_member_id and addressee_id = v_user_id)
+        )
+    ) then
+      raise exception 'All members must be accepted friends of the creator';
+    end if;
+  end loop;
+
+  -- Create conversation row
+  insert into public.conversations (type, title, created_by)
+  values ('group', v_clean_title, v_user_id)
+  returning id into v_conv_id;
+
+  -- Add creator as admin
+  insert into public.conversation_members (conversation_id, user_id, role)
+  values (v_conv_id, v_user_id, 'admin');
+
+  -- Add validated friends as members
+  foreach v_member_id in array v_valid_members loop
+    insert into public.conversation_members (conversation_id, user_id, role)
+    values (v_conv_id, v_member_id, 'member')
+    on conflict do nothing;
+  end loop;
+
+  return v_conv_id;
+end;
+$$;
+
+revoke all on function public.create_group_conversation(text, uuid[]) from public, anon;
+grant execute on function public.create_group_conversation(text, uuid[]) to authenticated;
+
+-- 2. Add Group Members RPC
+create or replace function public.add_group_members(
+  p_conv_id uuid,
+  p_member_ids uuid[]
+)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_member_id uuid;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  -- Verify caller is admin of this group
+  if not exists (
+    select 1 from public.conversation_members cm
+    join public.conversations c on c.id = cm.conversation_id
+    where cm.conversation_id = p_conv_id
+      and cm.user_id = v_user_id
+      and cm.role = 'admin'
+      and c.type = 'group'
+  ) then
+    raise exception 'Only group admins can add members';
+  end if;
+
+  foreach v_member_id in array p_member_ids loop
+    if v_member_id <> v_user_id then
+      -- Must be accepted friend of the admin
+      if exists (
+        select 1 from public.friendships
+        where status = 'accepted'
+          and (
+            (requester_id = v_user_id and addressee_id = v_member_id)
+            or (requester_id = v_member_id and addressee_id = v_user_id)
+          )
+      ) then
+        insert into public.conversation_members (conversation_id, user_id, role)
+        values (p_conv_id, v_member_id, 'member')
+        on conflict do nothing;
+      end if;
+    end if;
+  end loop;
+end;
+$$;
+
+revoke all on function public.add_group_members(uuid, uuid[]) from public, anon;
+grant execute on function public.add_group_members(uuid, uuid[]) to authenticated;
+
+-- 3. Remove Group Member RPC
+create or replace function public.remove_group_member(
+  p_conv_id uuid,
+  p_target_user_id uuid
+)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_caller_role text;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select role into v_caller_role
+  from public.conversation_members
+  where conversation_id = p_conv_id
+    and user_id = v_user_id;
+
+  if v_caller_role is null then
+    raise exception 'You are not a member of this conversation';
+  end if;
+
+  -- Caller can remove themselves (leave), or admin can remove any member
+  if v_user_id <> p_target_user_id and v_caller_role <> 'admin' then
+    raise exception 'Only admins can remove other members';
+  end if;
+
+  delete from public.conversation_members
+  where conversation_id = p_conv_id
+    and user_id = p_target_user_id;
+end;
+$$;
+
+revoke all on function public.remove_group_member(uuid, uuid) from public, anon;
+grant execute on function public.remove_group_member(uuid, uuid) to authenticated;
+
