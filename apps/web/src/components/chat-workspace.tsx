@@ -4,6 +4,26 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import CreateGroupDialog from "@/components/create-group-dialog";
+import MessageActionMenu, { MessageAction } from "@/components/message-action-menu";
+import {
+  MessageSquare,
+  Users,
+  Star as StarIcon,
+  User as UserIcon,
+  LogOut,
+  Search,
+  Plus,
+  Smile,
+  Clock,
+  Send,
+  Pin as PinIcon,
+  ArrowLeft,
+  X,
+  CheckCheck,
+  Check,
+  CheckSquare,
+  Trash2,
+} from "lucide-react";
 
 type Profile = {
   id: string;
@@ -72,7 +92,8 @@ export default function ChatWorkspace() {
     Record<string, Record<string, string>>
   >({});
   const [members, setMembers] = useState<Record<string, Profile>>({});
-  const [filteredIds, setFilteredIds] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [chatFilter, setChatFilter] = useState<"all" | "unread" | "groups">("all");
   const [selectedId, setSelectedId] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
@@ -92,7 +113,7 @@ export default function ChatWorkspace() {
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledItems, setScheduledItems] = useState<ScheduledItem[]>([]);
 
-  // Step 15: Reply, Edit, Star, Actions Menu
+  // WhatsApp-style Message Actions
   const [replyingTo, setReplyingTo] = useState<{
     id: string;
     content: string;
@@ -100,13 +121,25 @@ export default function ChatWorkspace() {
   } | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [starredMessageIds, setStarredMessageIds] = useState<string[]>([]);
-  const [activeMenuMessageId, setActiveMenuMessageId] = useState<string | null>(null);
+  const [pinnedMessageId, setPinnedMessageId] = useState<string | null>(null);
+  const [openActionMenuMsgId, setOpenActionMenuMsgId] = useState<string | null>(null);
 
-  // Step 16 & 17: Reactions and Receipts
+  // Multiple Selection Mode
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<string[]>([]);
+
+  // Reactions & Receipts
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [infoMessage, setInfoMessage] = useState<Message | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+
+  // Search input ref
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Mobile long-press timer
+  const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Cache & Rate Limit
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
@@ -126,7 +159,7 @@ export default function ChatWorkspace() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
-  // Fetch accepted friends for group creation
+  // Fetch accepted friends
   const loadFriends = useCallback(async (uid: string) => {
     try {
       const { data: rows, error: friendsError } = await supabase
@@ -254,7 +287,7 @@ export default function ChatWorkspace() {
     }
   }, [searchParams, conversations]);
 
-  // Load Reactions and Receipts for current messages
+  // Load Reactions and Receipts
   const loadReactionsAndReceipts = useCallback(async (msgIds: string[]) => {
     if (msgIds.length === 0) {
       setReactions([]);
@@ -277,7 +310,7 @@ export default function ChatWorkspace() {
       if (reactionsRes.data) setReactions(reactionsRes.data as Reaction[]);
       if (receiptsRes.data) setReceipts(receiptsRes.data as Receipt[]);
     } catch {
-      // Non-critical
+      // Non-critical fallback
     }
   }, []);
 
@@ -312,7 +345,6 @@ export default function ChatWorkspace() {
       const msgIds = freshList.map((m) => m.id);
       void loadReactionsAndReceipts(msgIds);
 
-      // Step 16: Mark messages as read for this conversation
       void supabase.rpc("mark_messages_read", {
         p_conversation_id: conversationId,
       });
@@ -322,7 +354,7 @@ export default function ChatWorkspace() {
     [loadReactionsAndReceipts, scrollToBottom]
   );
 
-  // Initialize Auth & Workspace
+  // Initialize Auth
   useEffect(() => {
     let active = true;
 
@@ -395,7 +427,7 @@ export default function ChatWorkspace() {
     };
   }, [selectedId, loadMessages]);
 
-  // Realtime subscription: Messages, Reactions, Receipts, Typing
+  // Realtime subscription
   useEffect(() => {
     if (!selectedId || !userId) return;
 
@@ -423,7 +455,6 @@ export default function ChatWorkspace() {
             messagesCacheRef.current[selectedId] = updated;
             return updated;
           });
-          // Mark read immediately
           void supabase.rpc("mark_messages_read", {
             p_conversation_id: selectedId,
           });
@@ -553,6 +584,44 @@ export default function ChatWorkspace() {
     return () => clearInterval(timer);
   }, [scheduledItems, userId, selectedId, loadMessages]);
 
+  // Step 18.3: Keyboard Shortcuts
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      // 1. Escape: Close open menus, clear replying/editing
+      if (e.key === "Escape") {
+        setOpenActionMenuMsgId(null);
+        setShowEmojiPicker(false);
+        setSelectionMode(false);
+        setSelectedMessageIds([]);
+        if (replyingTo) setReplyingTo(null);
+        if (editingMessageId) {
+          setEditingMessageId(null);
+          setDraft("");
+        }
+      }
+
+      // 2. Ctrl + K: Focus conversation search
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+
+      // 3. Shift + ArrowUp: Edit last sent message
+      if (e.shiftKey && e.key === "ArrowUp" && !editingMessageId) {
+        const mySent = [...messages].reverse().find((m) => m.sender_id === userId && !m.deleted_at);
+        if (mySent && mySent.content) {
+          e.preventDefault();
+          setEditingMessageId(mySent.id);
+          setDraft(mySent.content);
+          composerInputRef.current?.focus();
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [replyingTo, editingMessageId, messages, userId]);
+
   const broadcastTyping = useCallback(() => {
     if (!selectedId || !typingChannelRef.current) return;
     const now = Date.now();
@@ -610,7 +679,6 @@ export default function ChatWorkspace() {
 
     try {
       if (editingMessageId) {
-        // Step 15: Edit existing message
         const { error: editError } = await supabase
           .from("messages")
           .update({
@@ -626,7 +694,6 @@ export default function ChatWorkspace() {
         setDraft("");
         await loadMessages(selectedId);
       } else {
-        // New Message (optionally with reply_to_id)
         const payload: {
           conversation_id: string;
           sender_id: string;
@@ -664,7 +731,7 @@ export default function ChatWorkspace() {
   // Delete message
   async function handleDeleteMessage(messageId: string) {
     setError("");
-    setActiveMenuMessageId(null);
+    setOpenActionMenuMsgId(null);
     try {
       const { error: updateError } = await supabase
         .from("messages")
@@ -685,9 +752,21 @@ export default function ChatWorkspace() {
     }
   }
 
+  // Delete multiple selected messages
+  async function handleDeleteSelected() {
+    if (selectedMessageIds.length === 0) return;
+    try {
+      await Promise.all(selectedMessageIds.map((id) => handleDeleteMessage(id)));
+      setSelectedMessageIds([]);
+      setSelectionMode(false);
+    } catch {
+      // fallback
+    }
+  }
+
   // Toggle Reaction RPC
   async function handleToggleReaction(messageId: string, emoji: string) {
-    setActiveMenuMessageId(null);
+    setOpenActionMenuMsgId(null);
     try {
       await supabase.rpc("toggle_message_reaction", {
         p_message_id: messageId,
@@ -700,20 +779,72 @@ export default function ChatWorkspace() {
     }
   }
 
-  // Copy Message Content
-  function handleCopyMessage(content: string) {
-    setActiveMenuMessageId(null);
-    void navigator.clipboard.writeText(content);
+  // Handle Action Menu selection
+  function handleMessageAction(action: MessageAction, message: Message) {
+    setOpenActionMenuMsgId(null);
+    const senderName = members[message.sender_id]?.display_name || "User";
+
+    switch (action) {
+      case "reply":
+        setReplyingTo({
+          id: message.id,
+          content: message.content || "",
+          senderName,
+        });
+        composerInputRef.current?.focus();
+        break;
+      case "copy":
+        if (message.content) {
+          void navigator.clipboard.writeText(message.content);
+        }
+        break;
+      case "edit":
+        if (message.sender_id === userId && !message.deleted_at) {
+          setEditingMessageId(message.id);
+          setDraft(message.content || "");
+          composerInputRef.current?.focus();
+        }
+        break;
+      case "delete":
+        void handleDeleteMessage(message.id);
+        break;
+      case "star":
+        setStarredMessageIds((prev) =>
+          prev.includes(message.id)
+            ? prev.filter((id) => id !== message.id)
+            : [...prev, message.id]
+        );
+        break;
+      case "pin":
+        setPinnedMessageId((prev) => (prev === message.id ? null : message.id));
+        break;
+      case "info":
+        setInfoMessage(message);
+        break;
+      case "select":
+        setSelectionMode(true);
+        setSelectedMessageIds([message.id]);
+        break;
+      case "forward":
+        if (message.content) {
+          setDraft(message.content);
+        }
+        break;
+    }
   }
 
-  // Toggle Star
-  function handleToggleStar(messageId: string) {
-    setActiveMenuMessageId(null);
-    setStarredMessageIds((prev) =>
-      prev.includes(messageId)
-        ? prev.filter((id) => id !== messageId)
-        : [...prev, messageId]
-    );
+  // Mobile long-press handlers
+  function handleTouchStart(msgId: string) {
+    longPressTimerRef.current = setTimeout(() => {
+      setOpenActionMenuMsgId(msgId);
+    }, 500);
+  }
+
+  function handleTouchEnd() {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
   }
 
   // Schedule message handler
@@ -820,6 +951,18 @@ export default function ChatWorkspace() {
     (item) => item.conversation_id === selectedId
   );
 
+  // Filter conversations
+  const filteredConversations = conversations.filter((c) => {
+    const matchesSearch = conversationName(c)
+      .toLowerCase()
+      .includes(searchQuery.toLowerCase());
+    if (!matchesSearch) return false;
+    if (chatFilter === "groups") return c.type === "group";
+    return true;
+  });
+
+  const pinnedMessage = messages.find((m) => m.id === pinnedMessageId);
+
   if (loading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[var(--background)] text-[var(--muted)]">
@@ -829,64 +972,137 @@ export default function ChatWorkspace() {
   }
 
   return (
-    <main className="min-h-screen bg-[var(--background)] p-3 text-[var(--foreground)] sm:p-6">
-      <div className="mx-auto flex h-[calc(100dvh-24px)] max-w-7xl overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] sm:h-[calc(100dvh-48px)]">
-        {/* Left Sidebar */}
-        <aside
-          className={`${
-            selectedId ? "hidden md:flex" : "flex"
-          } w-full shrink-0 flex-col border-r border-[var(--border)] md:w-80`}
-        >
-          <div className="border-b border-[var(--border)] p-5">
-            <div className="flex items-center justify-between">
-              <span className="text-xl font-bold tracking-tight">PieChat</span>
-              <button
-                className="text-sm font-medium text-[var(--primary)] hover:underline"
-                onClick={() => router.push("/profile")}
-              >
-                Profile
-              </button>
+    <main className="min-h-screen bg-[var(--background)] p-0 text-[var(--foreground)] sm:p-4 md:p-6">
+      <div className="mx-auto flex h-[100dvh] max-w-[1600px] overflow-hidden rounded-none border-0 border-[var(--border)] bg-[var(--surface)] sm:h-[calc(100dvh-32px)] sm:rounded-2xl sm:border shadow-sm">
+        
+        {/* 1. Left Navigation Rail (Desktop vertical rail, mobile bottom bar) */}
+        <nav className="hidden w-16 shrink-0 flex-col items-center justify-between border-r border-[var(--border)] bg-[var(--background)] py-5 md:flex">
+          <div className="flex flex-col items-center gap-6">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--primary)] font-bold text-white shadow-sm">
+              P
             </div>
-            <p className="mt-2 truncate text-sm text-[var(--muted)]">
-              {profile?.display_name || profile?.username || "Your account"}
-            </p>
-
-            <div className="mt-4 flex items-center gap-2">
-              <input
-                aria-label="Search conversations"
-                placeholder="Search conversations"
-                className="w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
-                onChange={(event) => {
-                  const query = event.target.value.toLowerCase();
-                  const visible = conversations.filter((conversation) =>
-                    conversationName(conversation).toLowerCase().includes(query)
-                  );
-                  setFilteredIds(visible.map((conversation) => conversation.id));
-                }}
-              />
+            <div className="flex flex-col items-center gap-4">
               <button
-                onClick={() => {
-                  setError("");
-                  setShowCreateGroup(true);
-                }}
-                title="Create Group"
-                className="button-primary shrink-0 px-3 py-2 text-xs"
+                title="Chats"
+                className="flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--primary-soft)] text-[var(--primary)] transition"
               >
-                + Group
+                <MessageSquare size={20} />
+              </button>
+              <button
+                title="Friends"
+                onClick={() => router.push("/friends")}
+                className="flex h-10 w-10 items-center justify-center rounded-xl text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)] transition"
+              >
+                <Users size={20} />
+              </button>
+              <button
+                title="Starred Messages"
+                onClick={() => setChatFilter("all")}
+                className="flex h-10 w-10 items-center justify-center rounded-xl text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)] transition"
+              >
+                <StarIcon size={20} />
               </button>
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-2">
-            <p className="px-3 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
-              Conversations
-            </p>
-            {conversations.length === 0 ? (
-              <div className="px-3 py-5 text-center">
-                <p className="font-medium text-sm">No chats yet</p>
-                <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
-                  Find a friend or start a group to begin chatting.
-                </p>
+          <div className="flex flex-col items-center gap-4">
+            <button
+              title="Profile"
+              onClick={() => router.push("/profile")}
+              className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)] ring-2 ring-transparent hover:ring-[var(--primary)] transition"
+            >
+              {(profile?.display_name || profile?.username || "U").slice(0, 1).toUpperCase()}
+            </button>
+            <button
+              title="Log out"
+              onClick={async () => {
+                await supabase.auth.signOut();
+                router.replace("/auth");
+                router.refresh();
+              }}
+              className="flex h-10 w-10 items-center justify-center rounded-xl text-[var(--muted)] hover:bg-red-50 hover:text-red-600 transition"
+            >
+              <LogOut size={18} />
+            </button>
+          </div>
+        </nav>
+
+        {/* 2. Chat List Sidebar */}
+        <aside
+          className={`${
+            selectedId ? "hidden md:flex" : "flex"
+          } w-full shrink-0 flex-col border-r border-[var(--border)] md:w-96`}
+        >
+          {/* Top Header */}
+          <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3.5">
+            <h1 className="text-xl font-bold tracking-tight">Chats</h1>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setShowCreateGroup(true)}
+                title="New Group"
+                className="flex h-8 w-8 items-center justify-center rounded-lg hover:bg-[var(--background)] transition text-[var(--muted)] hover:text-[var(--foreground)]"
+              >
+                <Plus size={18} />
+              </button>
+              <button
+                onClick={() => router.push("/friends")}
+                title="Find Friends"
+                className="flex h-8 w-8 items-center justify-center rounded-lg hover:bg-[var(--background)] transition text-[var(--muted)] hover:text-[var(--foreground)]"
+              >
+                <Users size={18} />
+              </button>
+            </div>
+          </div>
+
+          {/* Search Bar & Filters */}
+          <div className="border-b border-[var(--border)] px-3 py-2.5">
+            <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-1.5 focus-within:border-[var(--primary)]">
+              <Search size={16} className="text-[var(--muted)]" />
+              <input
+                ref={searchInputRef}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search or start new chat (Ctrl+K)"
+                className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--muted)]"
+              />
+              {searchQuery && (
+                <button onClick={() => setSearchQuery("")}>
+                  <X size={14} className="text-[var(--muted)]" />
+                </button>
+              )}
+            </div>
+
+            {/* Filter Chips */}
+            <div className="mt-2.5 flex items-center gap-1.5">
+              <button
+                onClick={() => setChatFilter("all")}
+                className={`rounded-full px-3 py-1 text-xs font-medium transition ${
+                  chatFilter === "all"
+                    ? "bg-[var(--primary-soft)] text-[var(--primary)]"
+                    : "text-[var(--muted)] hover:bg-[var(--background)]"
+                }`}
+              >
+                All
+              </button>
+              <button
+                onClick={() => setChatFilter("groups")}
+                className={`rounded-full px-3 py-1 text-xs font-medium transition ${
+                  chatFilter === "groups"
+                    ? "bg-[var(--primary-soft)] text-[var(--primary)]"
+                    : "text-[var(--muted)] hover:bg-[var(--background)]"
+                }`}
+              >
+                Groups
+              </button>
+            </div>
+          </div>
+
+          {/* Conversation List */}
+          <div className="flex-1 overflow-y-auto p-1.5">
+            {filteredConversations.length === 0 ? (
+              <div className="px-4 py-8 text-center text-sm text-[var(--muted)]">
+                <p className="font-medium text-[var(--foreground)]">No conversations</p>
+                <p className="mt-1 text-xs">Find friends or create a group to begin.</p>
                 <div className="mt-4 flex justify-center gap-2">
                   <button
                     onClick={() => router.push("/friends")}
@@ -903,82 +1119,90 @@ export default function ChatWorkspace() {
                 </div>
               </div>
             ) : (
-              conversations
-                .filter(
-                  (conversation) =>
-                    !filteredIds.length || filteredIds.includes(conversation.id)
-                )
-                .map((conversation) => (
+              filteredConversations.map((conversation) => {
+                const name = conversationName(conversation);
+                const isSelected = selectedId === conversation.id;
+
+                return (
                   <button
                     key={conversation.id}
                     onClick={() => setSelectedId(conversation.id)}
-                    className={`mb-1 flex w-full items-center gap-3 rounded-md p-3 text-left transition ${
-                      selectedId === conversation.id
+                    className={`mb-1 flex w-full items-center gap-3 rounded-xl p-3 text-left transition ${
+                      isSelected
                         ? "bg-[var(--primary-soft)]"
                         : "hover:bg-[var(--background)]"
                     }`}
                   >
-                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
+                    <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)] shadow-inner">
                       {conversation.type === "group" ? (
                         <span>👥</span>
                       ) : (
-                        conversationName(conversation).slice(0, 1).toUpperCase()
+                        name.slice(0, 1).toUpperCase()
                       )}
                     </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-semibold">
-                        {conversationName(conversation)}
-                      </span>
-                      <span className="block text-xs text-[var(--muted)]">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between">
+                        <span className="truncate text-sm font-semibold">
+                          {name}
+                        </span>
+                        <span className="text-[11px] text-[var(--muted)]">
+                          {new Date(conversation.created_at).toLocaleDateString([], {
+                            month: "short",
+                            day: "numeric",
+                          })}
+                        </span>
+                      </div>
+                      <p className="truncate text-xs text-[var(--muted)] mt-0.5">
                         {conversation.type === "group"
                           ? `Group (${
                               conversationMembers[conversation.id]?.length || 0
                             } members)`
                           : "Direct message"}
-                      </span>
-                    </span>
+                      </p>
+                    </div>
                   </button>
-                ))
+                );
+              })
             )}
           </div>
 
-          <div className="flex gap-2 border-t border-[var(--border)] p-3">
+          {/* Mobile Bottom Navigation Rail */}
+          <div className="flex items-center justify-around border-t border-[var(--border)] p-2 md:hidden">
             <button
-              className="button-secondary flex-1 text-sm"
+              onClick={() => setChatFilter("all")}
+              className="flex flex-col items-center gap-1 text-[var(--primary)] text-[10px]"
+            >
+              <MessageSquare size={18} />
+              <span>Chats</span>
+            </button>
+            <button
               onClick={() => router.push("/friends")}
+              className="flex flex-col items-center gap-1 text-[var(--muted)] text-[10px]"
             >
-              Friends
+              <Users size={18} />
+              <span>Friends</span>
             </button>
             <button
-              className="button-secondary flex-1 text-sm"
-              onClick={() => setShowCreateGroup(true)}
+              onClick={() => router.push("/profile")}
+              className="flex flex-col items-center gap-1 text-[var(--muted)] text-[10px]"
             >
-              Create group
-            </button>
-            <button
-              className="button-secondary flex-1 text-sm"
-              onClick={async () => {
-                await supabase.auth.signOut();
-                router.replace("/auth");
-                router.refresh();
-              }}
-            >
-              Log out
+              <UserIcon size={18} />
+              <span>Profile</span>
             </button>
           </div>
         </aside>
 
-        {/* Chat / Message Panel */}
+        {/* 3. Main Conversation Panel */}
         <section
           className={`${
             selectedId ? "flex" : "hidden md:flex"
           } min-w-0 flex-1 flex-col`}
-          onClick={() => setActiveMenuMessageId(null)}
+          onClick={() => setOpenActionMenuMsgId(null)}
         >
           {selected ? (
             <>
               {/* Header */}
-              <header className="flex min-h-[72px] items-center justify-between border-b border-[var(--border)] px-4 sm:px-6">
+              <header className="flex min-h-[64px] items-center justify-between border-b border-[var(--border)] px-4 sm:px-6 bg-[var(--surface)]">
                 <div
                   className="flex items-center gap-3 min-w-0 cursor-pointer"
                   onClick={() => {
@@ -990,9 +1214,9 @@ export default function ChatWorkspace() {
                       e.stopPropagation();
                       setSelectedId("");
                     }}
-                    className="mr-1 text-sm font-medium text-[var(--primary)] md:hidden"
+                    className="mr-1 text-[var(--primary)] md:hidden"
                   >
-                    ← Back
+                    <ArrowLeft size={18} />
                   </button>
                   <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
                     {selected.type === "group" ? (
@@ -1002,33 +1226,83 @@ export default function ChatWorkspace() {
                     )}
                   </div>
                   <div className="min-w-0">
-                    <h1 className="truncate font-semibold">
+                    <h2 className="truncate font-semibold text-sm">
                       {conversationName(selected)}
-                    </h1>
+                    </h2>
                     <p className="text-xs text-[var(--muted)]">
                       {selected.type === "group"
-                        ? `${selectedConversationMemberIds.length} members • Click for details`
-                        : "Direct conversation"}
+                        ? `${selectedConversationMemberIds.length} members`
+                        : "Online"}
                     </p>
                   </div>
                 </div>
 
-                {selected.type === "group" && (
-                  <button
-                    onClick={() => setShowGroupInfo(true)}
-                    className="button-secondary text-xs px-2.5 py-1.5"
-                  >
-                    Group Info
-                  </button>
-                )}
+                <div className="flex items-center gap-2">
+                  {selected.type === "group" && (
+                    <button
+                      onClick={() => setShowGroupInfo(true)}
+                      className="button-secondary text-xs px-2.5 py-1.5"
+                    >
+                      Group Info
+                    </button>
+                  )}
+                  {selectionMode && (
+                    <button
+                      onClick={() => {
+                        setSelectionMode(false);
+                        setSelectedMessageIds([]);
+                      }}
+                      className="button-secondary text-xs px-2.5 py-1.5"
+                    >
+                      Cancel Selection
+                    </button>
+                  )}
+                </div>
               </header>
 
-              {/* Message History */}
-              <div className="flex-1 space-y-3 overflow-y-auto p-4 sm:p-6">
+              {/* Pinned Message Banner */}
+              {pinnedMessage && (
+                <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--primary-soft)] px-4 py-2 text-xs">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <PinIcon size={14} className="text-[var(--primary)] shrink-0" />
+                    <span className="font-semibold text-[var(--primary)]">Pinned:</span>
+                    <span className="truncate text-[var(--foreground)]">
+                      {pinnedMessage.content}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setPinnedMessageId(null)}
+                    title="Unpin"
+                    className="text-[var(--muted)] hover:text-black font-bold"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Multi-selection Bar */}
+              {selectionMode && (
+                <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-xs font-semibold shadow-inner">
+                  <span>{selectedMessageIds.length} message(s) selected</span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => void handleDeleteSelected()}
+                      disabled={selectedMessageIds.length === 0}
+                      className="flex items-center gap-1 text-red-600 hover:underline disabled:opacity-50"
+                    >
+                      <Trash2 size={14} />
+                      <span>Delete</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Message History List */}
+              <div className="flex-1 space-y-3 overflow-y-auto p-4 sm:p-6 bg-[var(--background)]/30">
                 {messages.length === 0 ? (
                   <div className="flex h-full min-h-48 flex-col items-center justify-center text-center">
-                    <p className="font-semibold">Start the conversation</p>
-                    <p className="mt-2 text-sm text-[var(--muted)]">
+                    <p className="font-semibold text-sm">Start the conversation</p>
+                    <p className="mt-1 text-xs text-[var(--muted)]">
                       Send a message to get things going.
                     </p>
                   </div>
@@ -1041,7 +1315,6 @@ export default function ChatWorkspace() {
                       senderProfile?.username ||
                       "User";
 
-                    // Quoted message if replied
                     const quoted = message.reply_to_id
                       ? messages.find((m) => m.id === message.reply_to_id)
                       : null;
@@ -1049,7 +1322,6 @@ export default function ChatWorkspace() {
                       ? members[quoted.sender_id]?.display_name || "User"
                       : "";
 
-                    // Reactions on this message
                     const msgReactions = reactions.filter(
                       (r) => r.message_id === message.id
                     );
@@ -1070,7 +1342,6 @@ export default function ChatWorkspace() {
                       }
                     }
 
-                    // Read Receipts for mine
                     const msgReceipts = receipts.filter(
                       (rc) => rc.message_id === message.id
                     );
@@ -1079,120 +1350,61 @@ export default function ChatWorkspace() {
                       (rc) => !!rc.delivered_at
                     );
                     const isStarred = starredMessageIds.includes(message.id);
+                    const isSelected = selectedMessageIds.includes(message.id);
 
                     return (
                       <div
                         key={message.id}
-                        className={`group relative flex ${
+                        className={`group relative flex items-start gap-2 ${
                           mine ? "justify-end" : "justify-start"
                         }`}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          setOpenActionMenuMsgId(message.id);
+                        }}
+                        onTouchStart={() => handleTouchStart(message.id)}
+                        onTouchEnd={handleTouchEnd}
                       >
-                        {/* Hover Quick Action Menu */}
-                        <div
-                          className={`absolute -top-7 ${
-                            mine ? "right-2" : "left-2"
-                          } z-10 hidden items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 shadow-sm group-hover:flex`}
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          {/* Quick Reactions */}
-                          {QUICK_EMOJIS.slice(0, 4).map((emoji) => (
-                            <button
-                              key={emoji}
-                              onClick={() =>
-                                void handleToggleReaction(message.id, emoji)
-                              }
-                              className="text-xs hover:scale-125 transition"
-                            >
-                              {emoji}
-                            </button>
-                          ))}
-                          <span className="mx-0.5 text-gray-300">|</span>
-                          {/* Reply */}
+                        {/* Selection Checkbox */}
+                        {selectionMode && (
                           <button
-                            onClick={() =>
-                              setReplyingTo({
-                                id: message.id,
-                                content: message.content || "",
-                                senderName,
-                              })
-                            }
-                            title="Reply"
-                            className="text-xs hover:text-[var(--primary)]"
+                            onClick={() => {
+                              setSelectedMessageIds((prev) =>
+                                prev.includes(message.id)
+                                  ? prev.filter((id) => id !== message.id)
+                                  : [...prev, message.id]
+                              );
+                            }}
+                            className="mt-2 text-[var(--primary)]"
                           >
-                            ↩️
+                            <CheckSquare
+                              size={18}
+                              className={isSelected ? "text-[var(--primary)] fill-current" : "text-gray-300"}
+                            />
                           </button>
-                          {/* Copy */}
-                          {message.content && (
-                            <button
-                              onClick={() => handleCopyMessage(message.content!)}
-                              title="Copy"
-                              className="text-xs hover:text-[var(--primary)]"
-                            >
-                              📋
-                            </button>
-                          )}
-                          {/* Star */}
-                          <button
-                            onClick={() => handleToggleStar(message.id)}
-                            title={isStarred ? "Unstar" : "Star"}
-                            className="text-xs hover:text-amber-500"
-                          >
-                            {isStarred ? "⭐" : "☆"}
-                          </button>
-                          {/* Info */}
-                          <button
-                            onClick={() => setInfoMessage(message)}
-                            title="Message Info"
-                            className="text-xs hover:text-[var(--primary)]"
-                          >
-                            ℹ️
-                          </button>
-                          {/* Edit (if mine) */}
-                          {mine && !message.deleted_at && (
-                            <button
-                              onClick={() => {
-                                setEditingMessageId(message.id);
-                                setDraft(message.content || "");
-                              }}
-                              title="Edit"
-                              className="text-xs hover:text-[var(--primary)]"
-                            >
-                              ✏️
-                            </button>
-                          )}
-                          {/* Delete (if mine or admin) */}
-                          {(mine || isUserAdmin) && !message.deleted_at && (
-                            <button
-                              onClick={() => void handleDeleteMessage(message.id)}
-                              title="Delete"
-                              className="text-xs hover:text-red-600"
-                            >
-                              🗑️
-                            </button>
-                          )}
-                        </div>
+                        )}
 
-                        {/* Message Bubble */}
+                        {/* Message Bubble Container */}
                         <div
-                          className={`relative max-w-[85%] whitespace-pre-wrap break-words rounded-lg px-4 py-3 sm:max-w-[70%] ${
+                          className={`relative max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 sm:max-w-[70%] shadow-sm transition ${
                             mine
-                              ? "bg-[var(--primary)] text-white"
-                              : "bg-[var(--background)]"
+                              ? "bg-[var(--primary)] text-white rounded-br-xs"
+                              : "bg-[var(--surface)] text-[var(--foreground)] border border-[var(--border)] rounded-bl-xs"
                           }`}
                         >
-                          {/* Sender name in group */}
+                          {/* Sender name in group chats */}
                           {!mine && selected.type === "group" && (
                             <p className="mb-1 text-xs font-semibold text-[var(--primary)]">
                               {senderName}
                             </p>
                           )}
 
-                          {/* Quoted preview if reply */}
+                          {/* Quoted Reply Block */}
                           {quoted && (
                             <div
-                              className={`mb-2 rounded border-l-2 p-1.5 text-xs ${
+                              className={`mb-2 rounded-lg border-l-3 p-2 text-xs ${
                                 mine
-                                  ? "border-white/80 bg-black/15 text-white/90"
+                                  ? "border-white bg-black/15 text-white/90"
                                   : "border-[var(--primary)] bg-black/5 text-[var(--muted)]"
                               }`}
                             >
@@ -1205,17 +1417,19 @@ export default function ChatWorkspace() {
                             </div>
                           )}
 
-                          {/* Content */}
+                          {/* Message Content */}
                           {message.deleted_at ? (
                             <span className="italic text-xs opacity-75">
                               This message was deleted
                             </span>
                           ) : (
-                            message.content || `[${message.message_type}]`
+                            <span className="text-sm leading-relaxed">
+                              {message.content || `[${message.message_type}]`}
+                            </span>
                           )}
 
-                          {/* Footer: Star, Edited, Time, Read Status */}
-                          <div className="mt-1 flex items-center justify-end gap-1.5">
+                          {/* Message Footer: Star, Edited, Time, Read Status */}
+                          <div className="mt-1 flex items-center justify-end gap-1.5 select-none">
                             {isStarred && (
                               <span className="text-[10px] text-amber-300">⭐</span>
                             )}
@@ -1242,7 +1456,6 @@ export default function ChatWorkspace() {
                               )}
                             </span>
 
-                            {/* Read Receipt Checkmarks (for sender) */}
                             {mine && (
                               <span
                                 title={
@@ -1252,13 +1465,15 @@ export default function ChatWorkspace() {
                                     ? "Delivered"
                                     : "Sent"
                                 }
-                                className={`text-[10px] font-bold ${
-                                  hasRead
-                                    ? "text-sky-300"
-                                    : "text-white/70"
-                                }`}
+                                className="inline-flex items-center"
                               >
-                                {hasRead ? "✓✓" : hasDelivered ? "✓✓" : "✓"}
+                                {hasRead ? (
+                                  <CheckCheck size={14} className="text-sky-300 font-bold" />
+                                ) : hasDelivered ? (
+                                  <CheckCheck size={14} className="text-white/70" />
+                                ) : (
+                                  <Check size={14} className="text-white/70" />
+                                )}
                               </span>
                             )}
                           </div>
@@ -1289,6 +1504,23 @@ export default function ChatWorkspace() {
                               )}
                             </div>
                           )}
+
+                          {/* WhatsApp-style Hover Arrow / Trigger Dropdown */}
+                          <div
+                            className={`absolute top-1.5 ${
+                              mine ? "-left-7" : "-right-7"
+                            } z-20 hidden group-hover:flex`}
+                          >
+                            <MessageActionMenu
+                              isOpen={openActionMenuMsgId === message.id}
+                              onClose={() => setOpenActionMenuMsgId(null)}
+                              onAction={(action) => handleMessageAction(action, message)}
+                              canEdit={mine && !message.deleted_at}
+                              canDelete={mine || isUserAdmin}
+                              isStarred={isStarred}
+                              isPinned={pinnedMessageId === message.id}
+                            />
+                          </div>
                         </div>
                       </div>
                     );
@@ -1381,10 +1613,10 @@ export default function ChatWorkspace() {
 
               {/* Emoji Picker Popover */}
               {showEmojiPicker && (
-                <div className="relative border-t border-[var(--border)] bg-[var(--surface)] p-2">
+                <div className="border-t border-[var(--border)] bg-[var(--surface)] p-2">
                   <div className="flex items-center justify-between px-2 pb-1">
                     <span className="text-xs font-semibold text-[var(--muted)]">
-                      Emoji Picker
+                      Emoji Palette
                     </span>
                     <button
                       onClick={() => setShowEmojiPicker(false)}
@@ -1413,19 +1645,19 @@ export default function ChatWorkspace() {
               {/* Composer */}
               <form
                 onSubmit={sendMessage}
-                className="flex items-end gap-2 border-t border-[var(--border)] p-3 sm:p-4"
+                className="flex items-end gap-2 border-t border-[var(--border)] p-3 sm:p-4 bg-[var(--surface)]"
               >
-                {/* Emoji toggle */}
                 <button
                   type="button"
                   title="Emoji"
                   onClick={() => setShowEmojiPicker((prev) => !prev)}
-                  className="button-secondary shrink-0 px-2.5 py-2.5 text-base"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-[var(--muted)] hover:bg-[var(--background)] hover:text-[var(--foreground)] transition"
                 >
-                  😊
+                  <Smile size={20} />
                 </button>
 
                 <textarea
+                  ref={composerInputRef}
                   value={draft}
                   onChange={(event) => handleDraftChange(event.target.value)}
                   onKeyDown={(event) => {
@@ -1441,45 +1673,45 @@ export default function ChatWorkspace() {
                       ? "Edit your message…"
                       : replyingTo
                       ? "Write a reply…"
-                      : "Write a message…"
+                      : "Type a message…"
                   }
                   aria-label="Message"
-                  className="max-h-32 min-h-11 flex-1 resize-y rounded-md border border-[var(--border)] bg-transparent px-3 py-3 text-sm outline-none focus:border-[var(--primary)]"
+                  className="max-h-32 min-h-11 flex-1 resize-y rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2.5 text-sm outline-none focus:border-[var(--primary)] transition"
                 />
 
-                {/* Schedule */}
                 {!editingMessageId && (
                   <button
                     type="button"
                     title="Schedule message"
                     disabled={!draft.trim()}
                     onClick={() => setShowScheduleModal(true)}
-                    className="button-secondary shrink-0 px-3 py-2.5 text-sm disabled:opacity-40"
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-[var(--muted)] hover:bg-[var(--background)] hover:text-[var(--foreground)] disabled:opacity-40 transition"
                   >
-                    ⏰
+                    <Clock size={19} />
                   </button>
                 )}
 
                 <button
                   disabled={sending || !draft.trim()}
-                  className="button-primary shrink-0 disabled:opacity-50"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--primary)] text-white hover:opacity-90 disabled:opacity-40 transition shadow-sm"
                 >
-                  {sending ? "Sending…" : editingMessageId ? "Save" : "Send"}
+                  <Send size={18} />
                 </button>
               </form>
             </>
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-              <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xl font-bold text-[var(--primary)]">
+              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[var(--primary-soft)] text-2xl font-bold text-[var(--primary)] shadow-sm">
                 P
               </div>
-              <h1 className="mt-5 text-2xl font-semibold tracking-tight">
-                Your conversations, all in one place.
-              </h1>
-              <p className="mt-3 max-w-sm text-sm leading-6 text-[var(--muted)]">
-                Select a conversation, create a group, or find friends to start chatting.
+              <h2 className="mt-5 text-2xl font-bold tracking-tight">
+                PieChat Web
+              </h2>
+              <p className="mt-2 max-w-sm text-sm leading-6 text-[var(--muted)]">
+                Send and receive messages without keeping your phone online.
+                Select a chat or find friends to start.
               </p>
-              <div className="mt-5 flex gap-3">
+              <div className="mt-6 flex gap-3">
                 <button
                   className="button-primary"
                   onClick={() => router.push("/friends")}
@@ -1490,7 +1722,7 @@ export default function ChatWorkspace() {
                   className="button-secondary"
                   onClick={() => setShowCreateGroup(true)}
                 >
-                  + Create Group
+                  + New Group
                 </button>
               </div>
             </div>
@@ -1513,12 +1745,12 @@ export default function ChatWorkspace() {
       {/* 2. Modal: Group Info & Management */}
       {showGroupInfo && selected && selected.type === "group" && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
-            <div className="flex items-center justify-between border-b border-[var(--border)] pb-3">
+          <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[var(--border)] pb-3.5">
               <div>
-                <h2 className="text-xl font-bold tracking-tight">
+                <h3 className="text-xl font-bold tracking-tight">
                   {conversationName(selected)}
-                </h2>
+                </h3>
                 <p className="text-xs text-[var(--muted)]">
                   {selectedConversationMemberIds.length} members
                 </p>
@@ -1551,7 +1783,7 @@ export default function ChatWorkspace() {
               </div>
 
               {showAddMembers && (
-                <div className="mt-2 rounded-md border border-[var(--border)] p-2">
+                <div className="mt-2 rounded-xl border border-[var(--border)] p-2">
                   <p className="text-xs text-[var(--muted)] mb-2">
                     Select friends to add to this group:
                   </p>
@@ -1569,13 +1801,13 @@ export default function ChatWorkspace() {
                       .map((friend) => (
                         <div
                           key={friend.id}
-                          className="flex items-center justify-between p-1 text-xs"
+                          className="flex items-center justify-between p-1.5 text-xs"
                         >
                           <span>{friend.display_name || friend.username}</span>
                           <button
                             onClick={() => void handleAddMembers([friend.id])}
                             disabled={groupActionLoading}
-                            className="button-primary text-[11px] px-2 py-1"
+                            className="button-primary text-[11px] px-2.5 py-1"
                           >
                             Add
                           </button>
@@ -1595,10 +1827,10 @@ export default function ChatWorkspace() {
                   return (
                     <div
                       key={mId}
-                      className="flex items-center justify-between rounded p-2 text-sm hover:bg-[var(--background)]"
+                      className="flex items-center justify-between rounded-lg p-2 text-sm hover:bg-[var(--background)] transition"
                     >
-                      <div className="flex items-center gap-2">
-                        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)]">
+                      <div className="flex items-center gap-2.5">
+                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)]">
                           {(mProfile?.display_name || mProfile?.username || "U")
                             .slice(0, 1)
                             .toUpperCase()}
@@ -1651,8 +1883,8 @@ export default function ChatWorkspace() {
       {/* 3. Modal: Schedule Message */}
       {showScheduleModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
-            <h2 className="text-lg font-bold tracking-tight">Schedule Message</h2>
+          <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-2xl">
+            <h3 className="text-lg font-bold tracking-tight">Schedule Message</h3>
             <p className="mt-1 text-xs text-[var(--muted)]">
               Choose the date and time when this message should be sent automatically.
             </p>
@@ -1667,11 +1899,11 @@ export default function ChatWorkspace() {
                   required
                   value={scheduledDate}
                   onChange={(e) => setScheduledDate(e.target.value)}
-                  className="mt-1.5 w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
+                  className="mt-1.5 w-full rounded-xl border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
                 />
               </div>
 
-              <div className="rounded bg-[var(--background)] p-3 text-xs text-[var(--muted)]">
+              <div className="rounded-xl bg-[var(--background)] p-3 text-xs text-[var(--muted)]">
                 <span className="font-semibold text-[var(--foreground)]">Message:</span>{" "}
                 &quot;{draft}&quot;
               </div>
@@ -1697,22 +1929,22 @@ export default function ChatWorkspace() {
         </div>
       )}
 
-      {/* 4. Modal: Message Info (Step 16) */}
+      {/* 4. Modal: Message Info */}
       {infoMessage && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
-            <h2 className="text-lg font-bold tracking-tight">Message Info</h2>
-            <div className="mt-3 rounded border border-[var(--border)] bg-[var(--background)] p-3 text-xs">
-              <p className="font-semibold">{infoMessage.content}</p>
-              <p className="mt-1 text-[10px] text-[var(--muted)]">
+          <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-2xl">
+            <h3 className="text-lg font-bold tracking-tight">Message Info</h3>
+            <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--background)] p-3.5 text-xs">
+              <p className="font-semibold text-sm">{infoMessage.content}</p>
+              <p className="mt-1.5 text-[10px] text-[var(--muted)]">
                 Sent: {new Date(infoMessage.created_at).toLocaleString()}
               </p>
             </div>
 
             <div className="mt-4 space-y-3">
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+              <h4 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
                 Read Receipts
-              </h3>
+              </h4>
               {receipts.filter((rc) => rc.message_id === infoMessage.id).length === 0 ? (
                 <p className="text-xs text-[var(--muted)]">
                   No read receipts recorded yet.
