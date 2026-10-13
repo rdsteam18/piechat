@@ -1616,7 +1616,7 @@ export default function ChatWorkspace() {
                               canDelete={mine || isUserAdmin}
                               isStarred={isStarred}
                               isPinned={pinnedMessageId === message.id}
-                              align="right"
+                              align={mine ? "right" : "left"}
                               isOwnMessage={mine}
                             />
                           </div>
