@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import CreateGroupDialog from "@/components/create-group-dialog";
 import MessageActionMenu, { MessageAction } from "@/components/message-action-menu";
+import { checkMessageEditEligibility } from "@/lib/message-actions";
 import {
   MessageSquare,
   Users,
@@ -699,16 +700,31 @@ export default function ChatWorkspace() {
 
     try {
       if (editingMessageId) {
-        const { error: editError } = await supabase
-          .from("messages")
-          .update({
-            content,
-            edited_at: new Date().toISOString(),
-          })
-          .eq("id", editingMessageId)
-          .eq("sender_id", userId);
+        // Enforce Smart Message Edit via Server-side RPC
+        const { error: editError } = await supabase.rpc("edit_message", {
+          p_message_id: editingMessageId,
+          p_content: content,
+        });
 
-        if (editError) throw editError;
+        if (editError) {
+          // If RPC is missing during initial migration, fall back to update
+          if (
+            editError.message.includes("function") &&
+            editError.message.includes("does not exist")
+          ) {
+            const { error: fallbackError } = await supabase
+              .from("messages")
+              .update({
+                content,
+                edited_at: new Date().toISOString(),
+              })
+              .eq("id", editingMessageId)
+              .eq("sender_id", userId);
+            if (fallbackError) throw fallbackError;
+          } else {
+            throw editError;
+          }
+        }
 
         setEditingMessageId(null);
         setDraft("");
@@ -748,17 +764,29 @@ export default function ChatWorkspace() {
     }
   }
 
-  // Delete message
+  // Delete message (Soft Delete for Everyone)
   async function handleDeleteMessage(messageId: string) {
     setError("");
     setOpenActionMenuMsgId(null);
     try {
-      const { error: updateError } = await supabase
-        .from("messages")
-        .update({ deleted_at: new Date().toISOString() })
-        .eq("id", messageId);
+      const { error: deleteError } = await supabase.rpc("delete_message", {
+        p_message_id: messageId,
+      });
 
-      if (updateError) throw updateError;
+      if (deleteError) {
+        if (
+          deleteError.message.includes("function") &&
+          deleteError.message.includes("does not exist")
+        ) {
+          const { error: fallbackError } = await supabase
+            .from("messages")
+            .update({ deleted_at: new Date().toISOString() })
+            .eq("id", messageId);
+          if (fallbackError) throw fallbackError;
+        } else {
+          throw deleteError;
+        }
+      }
 
       setMessages((current) =>
         current.map((m) =>
@@ -1377,16 +1405,13 @@ export default function ChatWorkspace() {
                       (rc) => rc.message_id === message.id && !!rc.read_at && rc.user_id !== userId
                     ).length;
 
-                    const canEditMessage = (() => {
-                      if (!mine || !!message.deleted_at) return false;
-                      if (selected.type === "direct") {
-                        // Direct chat: only editable if recipient hasn't read it
-                        return messageReadCount === 0;
-                      } else {
-                        // Group chat: editable if read by at most 2 members
-                        return messageReadCount <= 2;
-                      }
-                    })();
+                    const editCheck = checkMessageEditEligibility({
+                      isSender: mine,
+                      isDeleted: !!message.deleted_at,
+                      convType: selected.type,
+                      readerCount: messageReadCount,
+                    });
+                    const canEditMessage = editCheck.allowed;
 
                     return (
                       <div

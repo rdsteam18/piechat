@@ -759,3 +759,134 @@ alter publication supabase_realtime add table public.message_reactions;
 alter table public.message_receipts replica identity full;
 alter publication supabase_realtime add table public.message_receipts;
 
+-- ========================================================
+-- STEP 20: Secure Message Actions (Edit & Delete RPCs)
+-- ========================================================
+
+-- Edit Message RPC with Server-Side Read Limits Enforcement
+create or replace function public.edit_message(
+  p_message_id uuid,
+  p_content text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_msg record;
+  v_reader_count int;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if p_content is null or trim(p_content) = '' then
+    raise exception 'Message content cannot be empty';
+  end if;
+
+  select m.id, m.conversation_id, m.sender_id, m.deleted_at, c.type as conv_type
+  into v_msg
+  from public.messages m
+  join public.conversations c on c.id = m.conversation_id
+  where m.id = p_message_id;
+
+  if not found then
+    raise exception 'Message not found';
+  end if;
+
+  if v_msg.sender_id <> v_user_id then
+    raise exception 'Unauthorized: You can only edit your own messages';
+  end if;
+
+  if not public.is_conversation_member(v_msg.conversation_id) then
+    raise exception 'Unauthorized: You are not a member of this conversation';
+  end if;
+
+  if v_msg.deleted_at is not null then
+    raise exception 'Cannot edit a deleted message';
+  end if;
+
+  -- Count distinct recipients who have read this message
+  select count(distinct user_id)
+  into v_reader_count
+  from public.message_receipts
+  where message_id = p_message_id
+    and read_at is not null
+    and user_id <> v_user_id;
+
+  -- Direct chat rule: cannot edit if read by recipient
+  if v_msg.conv_type = 'direct' and v_reader_count > 0 then
+    raise exception 'Cannot edit: message has already been read by the recipient';
+  end if;
+
+  -- Group chat rule: cannot edit if read by more than 2 members
+  if v_msg.conv_type = 'group' and v_reader_count > 2 then
+    raise exception 'Cannot edit: message has been read by more than 2 members';
+  end if;
+
+  update public.messages
+  set content = p_content,
+      edited_at = now()
+  where id = p_message_id;
+
+  return true;
+end;
+$$;
+
+revoke all on function public.edit_message(uuid, text) from public, anon;
+grant execute on function public.edit_message(uuid, text) to authenticated;
+
+-- Delete Message RPC (Soft Delete for Everyone)
+create or replace function public.delete_message(p_message_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_msg record;
+  v_caller_role text;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select m.id, m.conversation_id, m.sender_id, m.deleted_at, c.type as conv_type
+  into v_msg
+  from public.messages m
+  join public.conversations c on c.id = m.conversation_id
+  where m.id = p_message_id;
+
+  if not found then
+    raise exception 'Message not found';
+  end if;
+
+  if not public.is_conversation_member(v_msg.conversation_id) then
+    raise exception 'Unauthorized: Not a member of this conversation';
+  end if;
+
+  select role into v_caller_role
+  from public.conversation_members
+  where conversation_id = v_msg.conversation_id
+    and user_id = v_user_id;
+
+  -- Only sender or group admin can delete
+  if v_msg.sender_id <> v_user_id and coalesce(v_caller_role, '') <> 'admin' then
+    raise exception 'Unauthorized: Only sender or group admin can delete this message';
+  end if;
+
+  update public.messages
+  set deleted_at = now()
+  where id = p_message_id;
+
+  return true;
+end;
+$$;
+
+revoke all on function public.delete_message(uuid) from public, anon;
+grant execute on function public.delete_message(uuid) to authenticated;
+
+
