@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
@@ -8,7 +8,8 @@ type Profile = {
   id: string;
   username: string;
   display_name: string;
-  bio: string;
+  bio: string | null;
+  avatar_url?: string | null;
 };
 
 type FriendRequest = {
@@ -18,15 +19,87 @@ type FriendRequest = {
   status: string;
 };
 
+type AcceptedFriend = {
+  friendshipId: string;
+  friend: Profile;
+};
+
 export default function FriendsPage() {
   const router = useRouter();
   const [userId, setUserId] = useState("");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Profile[]>([]);
   const [requests, setRequests] = useState<FriendRequest[]>([]);
+  const [acceptedFriends, setAcceptedFriends] = useState<AcceptedFriend[]>([]);
   const [profiles, setProfiles] = useState<Record<string, Profile>>({});
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
+  const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
+
+  const loadData = useCallback(async (currentUserId: string) => {
+    try {
+      // 1. Fetch incoming pending requests
+      const { data: incoming, error: reqError } = await supabase
+        .from("friendships")
+        .select("id, requester_id, addressee_id, status")
+        .eq("addressee_id", currentUserId)
+        .eq("status", "pending");
+
+      if (reqError) throw reqError;
+      setRequests(incoming ?? []);
+
+      // 2. Fetch accepted friendships
+      const { data: acceptedRows, error: acceptedError } = await supabase
+        .from("friendships")
+        .select("id, requester_id, addressee_id, status")
+        .or(`requester_id.eq.${currentUserId},addressee_id.eq.${currentUserId}`)
+        .eq("status", "accepted");
+
+      if (acceptedError) throw acceptedError;
+
+      // Collect IDs of all other profiles needed
+      const incomingIds = (incoming ?? []).map((r) => r.requester_id);
+      const acceptedOtherIds = (acceptedRows ?? []).map((r) =>
+        r.requester_id === currentUserId ? r.addressee_id : r.requester_id
+      );
+
+      const allIds = [...new Set([...incomingIds, ...acceptedOtherIds])];
+
+      if (allIds.length > 0) {
+        const { data: people, error: peopleError } = await supabase
+          .from("profiles")
+          .select("id, username, display_name, bio, avatar_url")
+          .in("id", allIds);
+
+        if (peopleError) throw peopleError;
+
+        const profileMap: Record<string, Profile> = {};
+        for (const p of (people ?? []) as Profile[]) {
+          profileMap[p.id] = p;
+        }
+        setProfiles(profileMap);
+
+        const acceptedList: AcceptedFriend[] = [];
+        for (const r of acceptedRows ?? []) {
+          const otherId =
+            r.requester_id === currentUserId ? r.addressee_id : r.requester_id;
+          if (profileMap[otherId]) {
+            acceptedList.push({
+              friendshipId: r.id,
+              friend: profileMap[otherId],
+            });
+          }
+        }
+        setAcceptedFriends(acceptedList);
+      } else {
+        setAcceptedFriends([]);
+      }
+    } catch (e) {
+      setStatus(
+        e instanceof Error ? e.message : "Could not load friendships data."
+      );
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -41,33 +114,7 @@ export default function FriendsPage() {
 
       if (!active) return;
       setUserId(data.user.id);
-
-      const { data: incoming, error: requestError } = await supabase
-        .from("friendships")
-        .select("id, requester_id, addressee_id, status")
-        .eq("addressee_id", data.user.id)
-        .eq("status", "pending");
-
-      if (!active) return;
-
-      if (requestError) {
-        setStatus(`Could not load requests: ${requestError.message}`);
-      } else {
-        setRequests(incoming ?? []);
-
-        const ids = [...new Set((incoming ?? []).map((r) => r.requester_id))];
-
-        if (ids.length) {
-          const { data: people } = await supabase
-            .from("profiles")
-            .select("id, username, display_name, bio")
-            .in("id", ids);
-
-          if (active && people) {
-            setProfiles(Object.fromEntries(people.map((p) => [p.id, p])));
-          }
-        }
-      }
+      await loadData(data.user.id);
     }
 
     void initialize();
@@ -75,7 +122,7 @@ export default function FriendsPage() {
     return () => {
       active = false;
     };
-  }, [router]);
+  }, [loadData, router]);
 
   async function searchUsers() {
     const username = query.trim().replace(/^@/, "");
@@ -90,7 +137,7 @@ export default function FriendsPage() {
 
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, username, display_name, bio")
+      .select("id, username, display_name, bio, avatar_url")
       .ilike("username", `%${username}%`)
       .neq("id", userId)
       .limit(20);
@@ -102,12 +149,13 @@ export default function FriendsPage() {
       return;
     }
 
-    setResults(data ?? []);
+    setResults((data ?? []) as Profile[]);
     if (!data?.length) setStatus("No users found.");
   }
 
   async function sendRequest(targetId: string) {
     setStatus("");
+    setActionLoading((prev) => ({ ...prev, [targetId]: true }));
 
     const { error } = await supabase.from("friendships").insert({
       requester_id: userId,
@@ -115,148 +163,269 @@ export default function FriendsPage() {
       status: "pending",
     });
 
+    setActionLoading((prev) => ({ ...prev, [targetId]: false }));
+
     if (error) {
       setStatus(
         error.code === "23505"
-          ? "A request between these accounts already exists."
+          ? "A request or connection with this user already exists."
           : `Could not send request: ${error.message}`
       );
       return;
     }
 
-    setStatus("Friend request sent.");
+    setStatus("Friend request sent successfully.");
   }
 
   async function respond(requestId: string, accept: boolean) {
     setStatus("");
+    setActionLoading((prev) => ({ ...prev, [requestId]: true }));
 
     const { error } = await supabase.rpc("respond_to_friend_request", {
       request_id: requestId,
       accept_request: accept,
     });
 
+    setActionLoading((prev) => ({ ...prev, [requestId]: false }));
+
     if (error) {
       setStatus(`Could not respond: ${error.message}`);
       return;
     }
 
-    setRequests((current) => current.filter((r) => r.id !== requestId));
-    setStatus(accept ? "Friend request accepted." : "Request rejected.");
+    setStatus(accept ? "Friend request accepted!" : "Request declined.");
+    if (userId) await loadData(userId);
+  }
+
+  async function openDirectChat(friendId: string) {
+    setStatus("");
+    setActionLoading((prev) => ({ ...prev, [`chat_${friendId}`]: true }));
+
+    try {
+      const { data: convId, error: rpcError } = await supabase.rpc(
+        "get_or_create_direct_conversation",
+        { p_friend_id: friendId }
+      );
+
+      if (rpcError) throw rpcError;
+
+      if (convId) {
+        router.push(`/dashboard?conversationId=${convId}`);
+      } else {
+        router.push("/dashboard");
+      }
+    } catch (e) {
+      setStatus(
+        e instanceof Error ? e.message : "Could not open conversation."
+      );
+      setActionLoading((prev) => ({ ...prev, [`chat_${friendId}`]: false }));
+    }
   }
 
   return (
-    <main className="mx-auto max-w-3xl space-y-8 p-5 sm:p-8">
-      <header>
-        <h1 className="text-3xl font-bold">Friends</h1>
-        <p className="mt-2 text-gray-600">
-          Find people by their PieChat username.
-        </p>
-      </header>
-
-      <section className="space-y-3">
-        <h2 className="text-xl font-semibold">Discover people</h2>
-        <form
-          className="flex gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void searchUsers();
-          }}
-        >
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search username"
-            className="min-w-0 flex-1 rounded-lg border px-3 py-3"
-            maxLength={24}
-          />
+    <main className="min-h-screen bg-[var(--background)] px-4 py-8 text-[var(--foreground)] sm:px-6">
+      <div className="mx-auto max-w-3xl space-y-8">
+        <header className="flex items-center justify-between border-b border-[var(--border)] pb-6">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Friends</h1>
+            <p className="mt-1 text-sm text-[var(--muted)]">
+              Find friends, manage requests, and start direct conversations.
+            </p>
+          </div>
           <button
-            disabled={loading}
-            className="rounded-lg bg-black px-4 py-3 text-white disabled:opacity-50"
+            onClick={() => router.push("/dashboard")}
+            className="button-secondary text-sm"
           >
-            {loading ? "Searching..." : "Search"}
+            ← Back to Chats
           </button>
-        </form>
+        </header>
 
-        <div className="space-y-3">
-          {results.map((person) => (
-            <article
-              key={person.id}
-              className="flex items-center justify-between gap-3 rounded-xl border p-4"
-            >
-              <div className="min-w-0">
-                <p className="truncate font-semibold">{person.display_name}</p>
-                <p className="truncate text-sm text-gray-500">
-                  @{person.username}
-                </p>
-                {person.bio && (
-                  <p className="mt-1 text-sm">{person.bio}</p>
-                )}
-              </div>
-              <button
-                onClick={() => void sendRequest(person.id)}
-                className="shrink-0 rounded-lg bg-black px-3 py-2 text-sm text-white"
-              >
-                Add friend
-              </button>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="space-y-3">
-        <h2 className="text-xl font-semibold">Incoming requests</h2>
-
-        {requests.length === 0 && (
-          <p className="text-sm text-gray-500">No pending requests.</p>
+        {status && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3.5 text-sm text-[var(--foreground)]"
+          >
+            {status}
+          </div>
         )}
 
-        {requests.map((request) => {
-          const person = profiles[request.requester_id];
+        {/* 1. Accepted Friends Section (Step 13) */}
+        <section className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">
+              My Friends ({acceptedFriends.length})
+            </h2>
+          </div>
 
-          return (
-            <article
-              key={request.id}
-              className="flex items-center justify-between gap-3 rounded-xl border p-4"
+          {acceptedFriends.length === 0 ? (
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6 text-center text-sm text-[var(--muted)]">
+              You haven&apos;t added any friends yet. Search for a username below to connect.
+            </div>
+          ) : (
+            <div className="grid gap-3">
+              {acceptedFriends.map(({ friendshipId, friend }) => (
+                <article
+                  key={friendshipId}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4 transition hover:border-[var(--primary)]"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
+                      {(friend.display_name || friend.username).slice(0, 1).toUpperCase()}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-sm">
+                        {friend.display_name}
+                      </p>
+                      <p className="truncate text-xs text-[var(--muted)]">
+                        @{friend.username}
+                      </p>
+                      {friend.bio && (
+                        <p className="mt-1 truncate text-xs text-[var(--muted)]">
+                          {friend.bio}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <button
+                    disabled={actionLoading[`chat_${friend.id}`]}
+                    onClick={() => void openDirectChat(friend.id)}
+                    className="button-primary shrink-0 text-sm disabled:opacity-50"
+                  >
+                    {actionLoading[`chat_${friend.id}`]
+                      ? "Opening…"
+                      : "Message"}
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* 2. Incoming Requests */}
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold tracking-tight">
+            Incoming Requests ({requests.length})
+          </h2>
+
+          {requests.length === 0 ? (
+            <p className="text-sm text-[var(--muted)]">No pending requests.</p>
+          ) : (
+            <div className="grid gap-3">
+              {requests.map((request) => {
+                const person = profiles[request.requester_id];
+                const isWorking = !!actionLoading[request.id];
+
+                return (
+                  <article
+                    key={request.id}
+                    className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-sm">
+                        {person?.display_name ?? "PieChat user"}
+                      </p>
+                      <p className="truncate text-xs text-[var(--muted)]">
+                        {person ? `@${person.username}` : "Incoming request"}
+                      </p>
+                    </div>
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        disabled={isWorking}
+                        onClick={() => void respond(request.id, true)}
+                        className="button-primary text-xs disabled:opacity-50"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        disabled={isWorking}
+                        onClick={() => void respond(request.id, false)}
+                        className="button-secondary text-xs disabled:opacity-50"
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* 3. Discover People */}
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold tracking-tight">Discover people</h2>
+          <form
+            className="flex gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void searchUsers();
+            }}
+          >
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search by username (e.g. devdhar)"
+              className="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-transparent px-3 py-2.5 text-sm outline-none focus:border-[var(--primary)]"
+              maxLength={24}
+            />
+            <button
+              disabled={loading}
+              className="button-primary text-sm disabled:opacity-50"
             >
-              <div>
-                <p className="font-semibold">
-                  {person?.display_name ?? "PieChat user"}
-                </p>
-                <p className="text-sm text-gray-500">
-                  {person ? `@${person.username}` : "Incoming request"}
-                </p>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => void respond(request.id, true)}
-                  className="rounded-lg bg-black px-3 py-2 text-sm text-white"
-                >
-                  Accept
-                </button>
-                <button
-                  onClick={() => void respond(request.id, false)}
-                  className="rounded-lg border px-3 py-2 text-sm"
-                >
-                  Reject
-                </button>
-              </div>
-            </article>
-          );
-        })}
-      </section>
+              {loading ? "Searching…" : "Search"}
+            </button>
+          </form>
 
-      {status && (
-        <p role="status" aria-live="polite" className="break-words rounded-lg border p-3 text-sm">
-          {status}
-        </p>
-      )}
+          {results.length > 0 && (
+            <div className="grid gap-3 pt-2">
+              {results.map((person) => {
+                const isFriend = acceptedFriends.some(
+                  (a) => a.friend.id === person.id
+                );
 
-      <button
-        onClick={() => router.push("/dashboard")}
-        className="text-sm underline"
-      >
-        Back to dashboard
-      </button>
+                return (
+                  <article
+                    key={person.id}
+                    className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-sm">
+                        {person.display_name}
+                      </p>
+                      <p className="truncate text-xs text-[var(--muted)]">
+                        @{person.username}
+                      </p>
+                      {person.bio && (
+                        <p className="mt-1 truncate text-xs text-[var(--muted)]">
+                          {person.bio}
+                        </p>
+                      )}
+                    </div>
+                    {isFriend ? (
+                      <button
+                        onClick={() => void openDirectChat(person.id)}
+                        className="button-secondary shrink-0 text-xs"
+                      >
+                        Message
+                      </button>
+                    ) : (
+                      <button
+                        disabled={actionLoading[person.id]}
+                        onClick={() => void sendRequest(person.id)}
+                        className="button-primary shrink-0 text-xs disabled:opacity-50"
+                      >
+                        {actionLoading[person.id] ? "Sending…" : "Add friend"}
+                      </button>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      </div>
     </main>
   );
 }

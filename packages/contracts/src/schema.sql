@@ -370,3 +370,65 @@ with check (
 alter table public.messages replica identity full;
 alter publication supabase_realtime add table public.messages;
 
+-- ========================================================
+-- STEP 13: Direct Conversation Creation RPC
+-- ========================================================
+
+create or replace function public.get_or_create_direct_conversation(p_friend_id uuid)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_conv_id uuid;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if v_user_id = p_friend_id then
+    raise exception 'Cannot create direct conversation with yourself';
+  end if;
+
+  -- Verify they are accepted friends
+  if not exists (
+    select 1 from public.friendships
+    where status = 'accepted'
+      and ((requester_id = v_user_id and addressee_id = p_friend_id)
+        or (requester_id = p_friend_id and addressee_id = v_user_id))
+  ) then
+    raise exception 'Users are not accepted friends';
+  end if;
+
+  -- Check existing direct conversation
+  select c.id into v_conv_id
+  from public.conversations c
+  join public.conversation_members cm1 on cm1.conversation_id = c.id and cm1.user_id = v_user_id
+  join public.conversation_members cm2 on cm2.conversation_id = c.id and cm2.user_id = p_friend_id
+  where c.type = 'direct'
+  limit 1;
+
+  if v_conv_id is not null then
+    return v_conv_id;
+  end if;
+
+  -- Create new direct conversation
+  insert into public.conversations (type, created_by)
+  values ('direct', v_user_id)
+  returning id into v_conv_id;
+
+  insert into public.conversation_members (conversation_id, user_id, role)
+  values
+    (v_conv_id, v_user_id, 'member'),
+    (v_conv_id, p_friend_id, 'member')
+  on conflict do nothing;
+
+  return v_conv_id;
+end;
+$$;
+
+revoke all on function public.get_or_create_direct_conversation(uuid) from public, anon;
+grant execute on function public.get_or_create_direct_conversation(uuid) to authenticated;
+

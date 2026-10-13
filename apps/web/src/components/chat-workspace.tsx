@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
 type Profile = {
@@ -30,6 +30,8 @@ type Message = {
 
 export default function ChatWorkspace() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const initialConversationParam = searchParams.get("conversationId");
 
   const [userId, setUserId] = useState("");
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -46,100 +48,146 @@ export default function ChatWorkspace() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
 
-  const loadConversations = useCallback(async (uid: string) => {
-    const { data: memberships, error: membershipError } = await supabase
-      .from("conversation_members")
-      .select("conversation_id")
-      .eq("user_id", uid);
+  // Step 12: In-memory client cache for instant switching
+  const messagesCacheRef = useRef<Record<string, Message[]>>({});
 
-    if (membershipError) throw membershipError;
+  // Step 12: Realtime typing state
+  const [typingUsers, setTypingUsers] = useState<
+    Record<string, { username: string; expiresAt: number }>
+  >({});
+  const lastTypingBroadcastRef = useRef<number>(0);
+  const typingChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
-    const ids = [...new Set((memberships ?? []).map((m) => m.conversation_id))];
+  // Step 12: Rate limiting tracker (client protection)
+  const recentSendTimestampsRef = useRef<number[]>([]);
 
-    if (ids.length === 0) {
-      setConversations([]);
-      setSelectedId("");
-      setMessages([]);
-      setMembers({});
-      setConversationMembers({});
-      return;
-    }
+  // Auto-scroll anchor
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-    const { data: rows, error: conversationError } = await supabase
-      .from("conversations")
-      .select("id,type,title,created_at")
-      .in("id", ids)
-      .order("created_at", { ascending: false });
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, []);
 
-    if (conversationError) throw conversationError;
+  const loadConversations = useCallback(
+    async (uid: string) => {
+      const { data: memberships, error: membershipError } = await supabase
+        .from("conversation_members")
+        .select("conversation_id")
+        .eq("user_id", uid);
 
-    const list = (rows ?? []) as Conversation[];
-    setConversations(list);
-    setSelectedId((previous) =>
-      list.some((conversation) => conversation.id === previous)
-        ? previous
-        : list[0]?.id ?? ""
-    );
+      if (membershipError) throw membershipError;
 
-    const { data: allMembers, error: membersError } = await supabase
-      .from("conversation_members")
-      .select("conversation_id,user_id")
-      .in("conversation_id", ids);
+      const ids = [...new Set((memberships ?? []).map((m) => m.conversation_id))];
 
-    if (membersError) throw membersError;
-
-    const convMembersMap: Record<string, string[]> = {};
-    for (const m of allMembers ?? []) {
-      if (!convMembersMap[m.conversation_id]) {
-        convMembersMap[m.conversation_id] = [];
+      if (ids.length === 0) {
+        setConversations([]);
+        setSelectedId("");
+        setMessages([]);
+        setMembers({});
+        setConversationMembers({});
+        return;
       }
-      convMembersMap[m.conversation_id].push(m.user_id);
-    }
-    setConversationMembers(convMembersMap);
 
-    const userIds = [
-      ...new Set(
-        (allMembers ?? []).map((m) => m.user_id).filter((id) => id !== uid)
-      ),
-    ];
+      const { data: rows, error: conversationError } = await supabase
+        .from("conversations")
+        .select("id,type,title,created_at")
+        .in("id", ids)
+        .order("created_at", { ascending: false });
 
-    if (userIds.length === 0) {
-      setMembers({});
-      return;
-    }
+      if (conversationError) throw conversationError;
 
-    const { data: profiles, error: profilesError } = await supabase
-      .from("profiles")
-      .select("id,username,display_name,avatar_url")
-      .in("id", userIds);
+      const list = (rows ?? []) as Conversation[];
+      setConversations(list);
 
-    if (profilesError) throw profilesError;
+      // Select from query param or keep previous or pick first
+      setSelectedId((previous) => {
+        if (
+          initialConversationParam &&
+          list.some((c) => c.id === initialConversationParam)
+        ) {
+          return initialConversationParam;
+        }
+        return list.some((conversation) => conversation.id === previous)
+          ? previous
+          : list[0]?.id ?? "";
+      });
 
-    const map: Record<string, Profile> = {};
-    for (const person of (profiles ?? []) as Profile[]) {
-      map[person.id] = person;
-    }
-    setMembers(map);
-  }, []);
+      const { data: allMembers, error: membersError } = await supabase
+        .from("conversation_members")
+        .select("conversation_id,user_id")
+        .in("conversation_id", ids);
 
-  const loadMessages = useCallback(async (conversationId: string) => {
-    if (!conversationId) {
-      setMessages([]);
-      return;
-    }
+      if (membersError) throw membersError;
 
-    const { data, error: messageError } = await supabase
-      .from("messages")
-      .select("id,conversation_id,sender_id,message_type,content,created_at,deleted_at")
-      .eq("conversation_id", conversationId)
-      .order("created_at", { ascending: true })
-      .limit(100);
+      const convMembersMap: Record<string, string[]> = {};
+      for (const m of allMembers ?? []) {
+        if (!convMembersMap[m.conversation_id]) {
+          convMembersMap[m.conversation_id] = [];
+        }
+        convMembersMap[m.conversation_id].push(m.user_id);
+      }
+      setConversationMembers(convMembersMap);
 
-    if (messageError) throw messageError;
+      const userIds = [
+        ...new Set(
+          (allMembers ?? []).map((m) => m.user_id).filter((id) => id !== uid)
+        ),
+      ];
 
-    setMessages((data ?? []) as Message[]);
-  }, []);
+      if (userIds.length === 0) {
+        setMembers({});
+        return;
+      }
 
+      const { data: profiles, error: profilesError } = await supabase
+        .from("profiles")
+        .select("id,username,display_name,avatar_url")
+        .in("id", userIds);
+
+      if (profilesError) throw profilesError;
+
+      const map: Record<string, Profile> = {};
+      for (const person of (profiles ?? []) as Profile[]) {
+        map[person.id] = person;
+      }
+      setMembers(map);
+    },
+    [initialConversationParam]
+  );
+
+  const loadMessages = useCallback(
+    async (conversationId: string) => {
+      if (!conversationId) {
+        setMessages([]);
+        return;
+      }
+
+      // 1. Show instantly from cache if present
+      if (messagesCacheRef.current[conversationId]) {
+        setMessages(messagesCacheRef.current[conversationId]);
+      }
+
+      // 2. Fetch fresh from Supabase
+      const { data, error: messageError } = await supabase
+        .from("messages")
+        .select(
+          "id,conversation_id,sender_id,message_type,content,created_at,deleted_at"
+        )
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true })
+        .limit(100);
+
+      if (messageError) throw messageError;
+
+      const freshList = (data ?? []) as Message[];
+      messagesCacheRef.current[conversationId] = freshList;
+      setMessages(freshList);
+      setTimeout(scrollToBottom, 50);
+    },
+    [scrollToBottom]
+  );
+
+  // Initialize Auth & Workspace
   useEffect(() => {
     let active = true;
 
@@ -153,7 +201,6 @@ export default function ChatWorkspace() {
         }
 
         if (!active) return;
-
         setUserId(data.user.id);
 
         const { data: ownProfile, error: profileError } = await supabase
@@ -183,6 +230,7 @@ export default function ChatWorkspace() {
     };
   }, [loadConversations, router]);
 
+  // Handle selected conversation change
   useEffect(() => {
     if (!selectedId) {
       setMessages([]);
@@ -194,15 +242,7 @@ export default function ChatWorkspace() {
     async function load() {
       try {
         setError("");
-        const { data, error: messageError } = await supabase
-          .from("messages")
-          .select("id,conversation_id,sender_id,message_type,content,created_at,deleted_at")
-          .eq("conversation_id", selectedId)
-          .order("created_at", { ascending: true })
-          .limit(100);
-
-        if (messageError) throw messageError;
-        if (active) setMessages((data ?? []) as Message[]);
+        await loadMessages(selectedId);
       } catch (e) {
         if (active) {
           setError(e instanceof Error ? e.message : "Could not load messages.");
@@ -215,13 +255,21 @@ export default function ChatWorkspace() {
     return () => {
       active = false;
     };
-  }, [selectedId]);
+  }, [selectedId, loadMessages]);
 
+  // Realtime subscription: Messages + Typing Presence Broadcast
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedId || !userId) return;
+
+    setTypingUsers({});
 
     const channel = supabase
-      .channel(`chat-${selectedId}`)
+      .channel(`chat-${selectedId}`, {
+        config: {
+          broadcast: { self: false },
+        },
+      })
+      // 1. Listen for new messages
       .on(
         "postgres_changes",
         {
@@ -232,25 +280,111 @@ export default function ChatWorkspace() {
         },
         (payload) => {
           const incoming = payload.new as Message;
-          setMessages((current) =>
-            current.some((message) => message.id === incoming.id)
-              ? current
-              : [...current, incoming]
-          );
+          setMessages((current) => {
+            if (current.some((m) => m.id === incoming.id)) return current;
+            const updated = [...current, incoming];
+            messagesCacheRef.current[selectedId] = updated;
+            return updated;
+          });
+          setTimeout(scrollToBottom, 50);
         }
       )
+      // 2. Listen for Realtime Typing broadcasts
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        if (!payload || payload.userId === userId) return;
+        const typingSenderId = payload.userId as string;
+        const typingSenderName = (payload.username as string) || "Someone";
+
+        setTypingUsers((current) => ({
+          ...current,
+          [typingSenderId]: {
+            username: typingSenderName,
+            expiresAt: Date.now() + 2500,
+          },
+        }));
+      })
       .subscribe();
 
+    typingChannelRef.current = channel;
+
+    // Timer to expire old typing indicators
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setTypingUsers((current) => {
+        let changed = false;
+        const next: Record<string, { username: string; expiresAt: number }> = {};
+        for (const [id, user] of Object.entries(current)) {
+          if (user.expiresAt > now) {
+            next[id] = user;
+          } else {
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    }, 1000);
+
     return () => {
+      clearInterval(interval);
+      typingChannelRef.current = null;
       void supabase.removeChannel(channel);
     };
-  }, [selectedId]);
+  }, [selectedId, userId, scrollToBottom]);
+
+  // Broadcast typing to other members (throttled to once every 1200ms)
+  const broadcastTyping = useCallback(() => {
+    if (!selectedId || !typingChannelRef.current) return;
+    const now = Date.now();
+    if (now - lastTypingBroadcastRef.current < 1200) return;
+
+    lastTypingBroadcastRef.current = now;
+    void typingChannelRef.current.send({
+      type: "broadcast",
+      event: "typing",
+      payload: {
+        userId,
+        username: profile?.display_name || profile?.username || "Someone",
+      },
+    });
+  }, [selectedId, userId, profile]);
+
+  // Handle composer change
+  function handleDraftChange(value: string) {
+    setDraft(value);
+    if (value.trim()) {
+      broadcastTyping();
+    }
+  }
+
+  // Rate Limiting Check: max 5 messages in 4 seconds, min 350ms cooldown
+  function checkRateLimit(): boolean {
+    const now = Date.now();
+    const windowStart = now - 4000;
+    const recent = recentSendTimestampsRef.current.filter((t) => t > windowStart);
+
+    if (recent.length >= 5) {
+      setError("Please slow down. You are sending messages too quickly.");
+      return false;
+    }
+
+    if (recent.length > 0 && now - recent[recent.length - 1] < 350) {
+      setError("Please wait a moment before sending another message.");
+      return false;
+    }
+
+    recent.push(now);
+    recentSendTimestampsRef.current = recent;
+    return true;
+  }
 
   async function sendMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const content = draft.trim();
     if (!content || !selectedId || !userId || sending) return;
+
+    // Step 12: Rate limiting validation
+    if (!checkRateLimit()) return;
 
     setSending(true);
     setError("");
@@ -265,6 +399,7 @@ export default function ChatWorkspace() {
 
       if (insertError) throw insertError;
 
+      // Clear composer on successful send
       setDraft("");
       await loadMessages(selectedId);
     } catch (e) {
@@ -281,7 +416,7 @@ export default function ChatWorkspace() {
       return conversation.title || "Untitled group";
     }
 
-    // Accurate conversation-specific member lookup
+    // Accurate direct-chat partner name
     const memberIds = conversationMembers[conversation.id] ?? [];
     const otherId = memberIds.find((id) => id !== userId);
     const otherMember = otherId ? members[otherId] : undefined;
@@ -290,6 +425,10 @@ export default function ChatWorkspace() {
       otherMember?.display_name || otherMember?.username || "Direct conversation"
     );
   }
+
+  const activeTypingList = Object.values(typingUsers).filter(
+    (u) => u.expiresAt > Date.now()
+  );
 
   if (loading) {
     return (
@@ -302,7 +441,7 @@ export default function ChatWorkspace() {
   return (
     <main className="min-h-screen bg-[var(--background)] p-3 text-[var(--foreground)] sm:p-6">
       <div className="mx-auto flex h-[calc(100dvh-24px)] max-w-7xl overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] sm:h-[calc(100dvh-48px)]">
-        {/* Sidebar / Conversation list */}
+        {/* Left Sidebar / Conversation List */}
         <aside
           className={`${
             selectedId ? "hidden md:flex" : "flex"
@@ -341,13 +480,13 @@ export default function ChatWorkspace() {
             </p>
             {conversations.length === 0 ? (
               <div className="px-3 py-5 text-center">
-                <p className="font-medium">No chats yet</p>
-                <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
+                <p className="font-medium text-sm">No chats yet</p>
+                <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
                   Find a friend to start a conversation.
                 </p>
                 <button
                   onClick={() => router.push("/friends")}
-                  className="button-primary mt-4"
+                  className="button-primary mt-4 text-xs"
                 >
                   Find friends
                 </button>
@@ -388,13 +527,13 @@ export default function ChatWorkspace() {
 
           <div className="flex gap-2 border-t border-[var(--border)] p-3">
             <button
-              className="button-secondary flex-1"
+              className="button-secondary flex-1 text-sm"
               onClick={() => router.push("/friends")}
             >
               Friends
             </button>
             <button
-              className="button-secondary flex-1"
+              className="button-secondary flex-1 text-sm"
               onClick={async () => {
                 await supabase.auth.signOut();
                 router.replace("/auth");
@@ -482,10 +621,26 @@ export default function ChatWorkspace() {
                     );
                   })
                 )}
+                <div ref={messagesEndRef} />
               </div>
 
+              {/* Realtime Typing Indicator */}
+              {activeTypingList.length > 0 && (
+                <div className="flex items-center gap-2 px-4 py-1.5 text-xs text-[var(--muted)] transition-opacity animate-fade-in">
+                  <div className="flex items-center gap-1">
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)] [animation-delay:-0.3s]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)] [animation-delay:-0.15s]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)]" />
+                  </div>
+                  <span>
+                    {activeTypingList.map((u) => u.username).join(", ")}{" "}
+                    {activeTypingList.length > 1 ? "are" : "is"} typing…
+                  </span>
+                </div>
+              )}
+
               {error && (
-                <p role="alert" className="px-4 text-sm text-red-700">
+                <p role="alert" className="px-4 py-1 text-xs text-red-600">
                   {error}
                 </p>
               )}
@@ -496,7 +651,7 @@ export default function ChatWorkspace() {
               >
                 <textarea
                   value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
+                  onChange={(event) => handleDraftChange(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
