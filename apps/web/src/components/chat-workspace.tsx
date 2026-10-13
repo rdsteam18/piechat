@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import CreateGroupDialog from "@/components/create-group-dialog";
 
 type Profile = {
   id: string;
@@ -156,16 +157,18 @@ export default function ChatWorkspace() {
       const list = (rows ?? []) as Conversation[];
       setConversations(list);
 
+      const requestedId = searchParams.get("conversationId");
+
       setSelectedId((previous) => {
-        if (
-          initialConversationParam &&
-          list.some((c) => c.id === initialConversationParam)
-        ) {
-          return initialConversationParam;
+        if (requestedId && list.some((item) => item.id === requestedId)) {
+          return requestedId;
         }
-        return list.some((conversation) => conversation.id === previous)
-          ? previous
-          : list[0]?.id ?? "";
+
+        if (list.some((item) => item.id === previous)) {
+          return previous;
+        }
+
+        return list[0]?.id ?? "";
       });
 
       const { data: allMembers, error: membersError } = await supabase
@@ -211,8 +214,15 @@ export default function ChatWorkspace() {
       }
       setMembers(map);
     },
-    [initialConversationParam]
+    [searchParams]
   );
+
+  useEffect(() => {
+    const requestedId = searchParams.get("conversationId");
+    if (requestedId && conversations.some((item) => item.id === requestedId)) {
+      setSelectedId(requestedId);
+    }
+  }, [searchParams, conversations]);
 
   const loadMessages = useCallback(
     async (conversationId: string) => {
@@ -814,6 +824,12 @@ export default function ChatWorkspace() {
             </button>
             <button
               className="button-secondary flex-1 text-sm"
+              onClick={() => setShowCreateGroup(true)}
+            >
+              Create group
+            </button>
+            <button
+              className="button-secondary flex-1 text-sm"
               onClick={async () => {
                 await supabase.auth.signOut();
                 router.replace("/auth");
@@ -1076,97 +1092,14 @@ export default function ChatWorkspace() {
 
       {/* 1. Modal: Create New Group */}
       {showCreateGroup && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
-            <h2 className="text-xl font-bold tracking-tight">Create Group</h2>
-            <p className="mt-1 text-xs text-[var(--muted)]">
-              Name your group and choose friends to add.
-            </p>
-
-            <form onSubmit={handleCreateGroup} className="mt-5 space-y-4">
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Group Name
-                </label>
-                <input
-                  required
-                  maxLength={60}
-                  value={groupTitleDraft}
-                  onChange={(e) => setGroupTitleDraft(e.target.value)}
-                  placeholder="e.g. Design Team, Family, Study Buddies"
-                  className="mt-1.5 w-full rounded-md border border-[var(--border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--primary)]"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Select Friends ({selectedFriendIds.length} selected)
-                </label>
-                <div className="mt-2 max-h-48 overflow-y-auto space-y-2 rounded-md border border-[var(--border)] p-2">
-                  {acceptedFriends.length === 0 ? (
-                    <p className="p-2 text-xs text-[var(--muted)]">
-                      No accepted friends found. Add friends first to start a group!
-                    </p>
-                  ) : (
-                    acceptedFriends.map((friend) => {
-                      const isChecked = selectedFriendIds.includes(friend.id);
-                      return (
-                        <label
-                          key={friend.id}
-                          className="flex cursor-pointer items-center justify-between rounded p-2 text-sm transition hover:bg-[var(--background)]"
-                        >
-                          <div className="flex items-center gap-2">
-                            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)]">
-                              {(friend.display_name || friend.username || "U")
-                                .slice(0, 1)
-                                .toUpperCase()}
-                            </span>
-                            <span>{friend.display_name || friend.username}</span>
-                          </div>
-                          <input
-                            type="checkbox"
-                            checked={isChecked}
-                            onChange={() => {
-                              setSelectedFriendIds((prev) =>
-                                isChecked
-                                  ? prev.filter((id) => id !== friend.id)
-                                  : [...prev, friend.id]
-                              );
-                            }}
-                            className="h-4 w-4 rounded accent-[var(--primary)]"
-                          />
-                        </label>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-
-              {error && <p className="text-xs text-red-600">{error}</p>}
-
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowCreateGroup(false)}
-                  className="button-secondary text-sm"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={
-                    groupActionLoading ||
-                    !groupTitleDraft.trim() ||
-                    selectedFriendIds.length === 0
-                  }
-                  className="button-primary text-sm disabled:opacity-50"
-                >
-                  {groupActionLoading ? "Creating…" : "Create Group"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <CreateGroupDialog
+          onClose={() => setShowCreateGroup(false)}
+          onCreated={(conversationId) => {
+            setShowCreateGroup(false);
+            router.push(`/dashboard?conversationId=${conversationId}`);
+            router.refresh();
+          }}
+        />
       )}
 
       {/* 2. Modal: Group Info & Management */}
