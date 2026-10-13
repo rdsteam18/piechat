@@ -24,7 +24,10 @@ import {
   Check,
   CheckSquare,
   Trash2,
+  Phone,
 } from "lucide-react";
+import VoiceCallModal from "@/components/voice-call-modal";
+import CallHistoryModal from "@/components/call-history-modal";
 
 type Profile = {
   id: string;
@@ -135,6 +138,19 @@ export default function ChatWorkspace() {
   const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [infoMessage, setInfoMessage] = useState<Message | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+
+  // Voice Calling
+  const [isVoiceCallOpen, setIsVoiceCallOpen] = useState(false);
+  const [isVoiceCallInitiator, setIsVoiceCallInitiator] = useState(false);
+  const [incomingOffer, setIncomingOffer] = useState<{
+    callId: string;
+    callerId: string;
+    callerName: string;
+    sdp: RTCSessionDescriptionInit;
+    conversationId: string;
+  } | null>(null);
+  const [activeCallConversationId, setActiveCallConversationId] = useState("");
+  const [showCallHistory, setShowCallHistory] = useState(false);
 
   // Search input ref
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -289,6 +305,49 @@ export default function ChatWorkspace() {
     }
   }, [searchParams, conversations]);
 
+  // Listen for incoming voice calls for this user
+  useEffect(() => {
+    if (!userId) return;
+
+    const userCallChannel = supabase.channel(`user-calls-${userId}`, {
+      config: { broadcast: { self: false } },
+    });
+
+    userCallChannel
+      .on("broadcast", { event: "incoming_call" }, (payload) => {
+        const data = payload.payload;
+        if (data && data.callerId !== userId) {
+          setIncomingOffer({
+            callId: data.callId,
+            callerId: data.callerId,
+            callerName: data.callerName,
+            sdp: data.sdp,
+            conversationId: data.conversationId,
+          });
+          setActiveCallConversationId(data.conversationId);
+          setIsVoiceCallInitiator(false);
+          setIsVoiceCallOpen(true);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(userCallChannel);
+    };
+  }, [userId]);
+
+  function handleStartVoiceCall() {
+    if (!selected || selected.type !== "direct") return;
+    const memberIds = conversationMembers[selected.id] ?? [];
+    const otherId = memberIds.find((id) => id !== userId);
+    if (!otherId) return;
+
+    setActiveCallConversationId(selected.id);
+    setIsVoiceCallInitiator(true);
+    setIncomingOffer(null);
+    setIsVoiceCallOpen(true);
+  }
+
   // Load Reactions and Receipts
   const loadReactionsAndReceipts = useCallback(async (msgIds: string[]) => {
     if (msgIds.length === 0) {
@@ -362,20 +421,31 @@ export default function ChatWorkspace() {
 
     async function initialize() {
       try {
-        const { data, error: authError } = await supabase.auth.getUser();
+        let authUser: { id: string } | null = null;
 
-        if (authError || !data.user) {
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (sessionData.session?.user) {
+          authUser = sessionData.session.user;
+        } else {
+          const { data: userData, error: authError } =
+            await supabase.auth.getUser();
+          if (!authError && userData?.user) {
+            authUser = userData.user;
+          }
+        }
+
+        if (!authUser) {
           router.replace("/auth");
           return;
         }
 
         if (!active) return;
-        setUserId(data.user.id);
+        setUserId(authUser.id);
 
         const { data: ownProfile, error: profileError } = await supabase
           .from("profiles")
           .select("id,username,display_name,avatar_url")
-          .eq("id", data.user.id)
+          .eq("id", authUser.id)
           .maybeSingle();
 
         if (profileError) throw profileError;
@@ -383,8 +453,8 @@ export default function ChatWorkspace() {
 
         setProfile(ownProfile as Profile | null);
         await Promise.all([
-          loadConversations(data.user.id),
-          loadFriends(data.user.id),
+          loadConversations(authUser.id),
+          loadFriends(authUser.id),
         ]);
       } catch (e) {
         if (active) {
@@ -397,8 +467,17 @@ export default function ChatWorkspace() {
 
     void initialize();
 
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_OUT" || (!session && event !== "INITIAL_SESSION")) {
+        router.replace("/auth");
+      }
+    });
+
     return () => {
       active = false;
+      subscription.unsubscribe();
     };
   }, [loadConversations, loadFriends, router]);
 
@@ -554,7 +633,8 @@ export default function ChatWorkspace() {
   useEffect(() => {
     if (!openReactionPickerMsgId) return;
 
-    function handleClickOutside() {
+    function handleClickOutside(e: MouseEvent) {
+      if ((e.target as HTMLElement)?.closest("[data-reaction-picker]")) return;
       setOpenReactionPickerMsgId(null);
     }
     function handleKeyDown(e: KeyboardEvent) {
@@ -1050,6 +1130,14 @@ export default function ChatWorkspace() {
               >
                 <StarIcon size={20} />
               </button>
+              <button
+                id="nav-calls-button"
+                title="Calls"
+                onClick={() => setShowCallHistory(true)}
+                className="flex h-10 w-10 items-center justify-center rounded-xl text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)] transition cursor-pointer"
+              >
+                <Phone size={19} />
+              </button>
             </div>
           </div>
 
@@ -1231,6 +1319,13 @@ export default function ChatWorkspace() {
               <span>Friends</span>
             </button>
             <button
+              onClick={() => setShowCallHistory(true)}
+              className="flex flex-col items-center gap-1 text-[var(--muted)] text-[10px]"
+            >
+              <Phone size={18} />
+              <span>Calls</span>
+            </button>
+            <button
               onClick={() => router.push("/profile")}
               className="flex flex-col items-center gap-1 text-[var(--muted)] text-[10px]"
             >
@@ -1286,6 +1381,18 @@ export default function ChatWorkspace() {
                 </div>
 
                 <div className="flex items-center gap-2">
+                  {selected.type === "direct" && (
+                    <button
+                      id="direct-call-button"
+                      onClick={handleStartVoiceCall}
+                      className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-hover)] px-2.5 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--primary)] hover:text-white transition-colors cursor-pointer"
+                      title="Audio Call"
+                      aria-label="Start Voice Call"
+                    >
+                      <Phone size={15} />
+                      <span className="hidden sm:inline">Call</span>
+                    </button>
+                  )}
                   {selected.type === "group" && (
                     <button
                       onClick={() => setShowGroupInfo(true)}
@@ -1470,16 +1577,20 @@ export default function ChatWorkspace() {
                             {/* Floating WhatsApp Quick Emoji Bar */}
                             {openReactionPickerMsgId === message.id && (
                               <div
+                                data-reaction-picker="true"
                                 className={`absolute bottom-full mb-1.5 ${
                                   mine ? "right-0" : "left-0"
                                 } z-40 flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-1 shadow-xl animate-fade-in`}
+                                onMouseDown={(e) => e.stopPropagation()}
                                 onClick={(e) => e.stopPropagation()}
                               >
                                 {QUICK_EMOJIS.map((emoji) => (
                                   <button
                                     key={emoji}
                                     type="button"
-                                    onClick={() => {
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
                                       void handleToggleReaction(message.id, emoji);
                                       setOpenReactionPickerMsgId(null);
                                     }}
@@ -2111,6 +2222,54 @@ export default function ChatWorkspace() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Call History Modal */}
+      {showCallHistory && (
+        <CallHistoryModal
+          currentUserId={userId}
+          onClose={() => setShowCallHistory(false)}
+          onInitiateCall={(convId, contactId) => {
+            setShowCallHistory(false);
+            setActiveCallConversationId(convId);
+            setIsVoiceCallInitiator(true);
+            setIncomingOffer(null);
+            setIsVoiceCallOpen(true);
+          }}
+        />
+      )}
+
+      {/* Voice Call Modal */}
+      {isVoiceCallOpen && activeCallConversationId && (
+        <VoiceCallModal
+          currentUserId={userId}
+          currentUserProfile={profile}
+          conversationId={activeCallConversationId}
+          recipient={
+            (() => {
+              const memberIds =
+                conversationMembers[activeCallConversationId] ?? [];
+              const otherId =
+                memberIds.find((id) => id !== userId) ||
+                incomingOffer?.callerId;
+              return otherId
+                ? members[otherId] || {
+                    id: otherId,
+                    username: incomingOffer?.callerName || "Caller",
+                    display_name: incomingOffer?.callerName || "Caller",
+                    avatar_url: null,
+                  }
+                : null;
+            })()
+          }
+          isInitiator={isVoiceCallInitiator}
+          incomingOfferData={incomingOffer}
+          onClose={() => {
+            setIsVoiceCallOpen(false);
+            setIncomingOffer(null);
+            setActiveCallConversationId("");
+          }}
+        />
       )}
     </main>
   );

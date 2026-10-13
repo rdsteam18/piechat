@@ -1,5 +1,10 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { PublicFooter, PublicHeader } from "@/components/public-site";
+import { supabase } from "@/lib/supabase";
 
 const features = [
   {
@@ -41,6 +46,33 @@ const features = [
 ];
 
 export default function HomePage() {
+  const router = useRouter();
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session && active) {
+        router.replace("/dashboard");
+      } else if (active) {
+        setChecking(false);
+      }
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [router]);
+
+  if (checking) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[var(--background)]">
+        <div className="h-7 w-7 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent" />
+      </div>
+    );
+  }
+
   return (
     <>
       <PublicHeader />

@@ -889,4 +889,54 @@ $$;
 revoke all on function public.delete_message(uuid) from public, anon;
 grant execute on function public.delete_message(uuid) to authenticated;
 
+-- ========================================================
+-- STEP 21: Audio Voice Calling System (Calls Table & Policies)
+-- ========================================================
+
+create table if not exists public.calls (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  caller_id uuid not null references public.profiles(id) on delete cascade,
+  recipient_id uuid not null references public.profiles(id) on delete cascade,
+  status text not null default 'ringing' check (status in ('ringing', 'accepted', 'rejected', 'busy', 'cancelled', 'missed', 'failed', 'ended')),
+  started_at timestamptz,
+  ended_at timestamptz,
+  duration integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists calls_conversation_idx on public.calls(conversation_id);
+create index if not exists calls_caller_idx on public.calls(caller_id);
+create index if not exists calls_recipient_idx on public.calls(recipient_id);
+
+alter table public.calls enable row level security;
+
+drop policy if exists "calls_select_members" on public.calls;
+create policy "calls_select_members"
+on public.calls for select to authenticated
+using (
+  public.is_conversation_member(conversation_id)
+);
+
+drop policy if exists "calls_insert_caller" on public.calls;
+create policy "calls_insert_caller"
+on public.calls for insert to authenticated
+with check (
+  caller_id = (select auth.uid())
+  and public.is_conversation_member(conversation_id)
+);
+
+drop policy if exists "calls_update_participants" on public.calls;
+create policy "calls_update_participants"
+on public.calls for update to authenticated
+using (
+  caller_id = (select auth.uid()) or recipient_id = (select auth.uid())
+)
+with check (
+  caller_id = (select auth.uid()) or recipient_id = (select auth.uid())
+);
+
+alter table public.calls replica identity full;
+alter publication supabase_realtime add table public.calls;
+
 

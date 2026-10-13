@@ -105,16 +105,25 @@ export default function FriendsPage() {
     let active = true;
 
     async function initialize() {
-      const { data, error } = await supabase.auth.getUser();
+      let authUser: { id: string } | null = null;
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData.session?.user) {
+        authUser = sessionData.session.user;
+      } else {
+        const { data: userData } = await supabase.auth.getUser();
+        if (userData?.user) {
+          authUser = userData.user;
+        }
+      }
 
-      if (error || !data.user) {
+      if (!authUser) {
         router.replace("/auth");
         return;
       }
 
       if (!active) return;
-      setUserId(data.user.id);
-      await loadData(data.user.id);
+      setUserId(authUser.id);
+      await loadData(authUser.id);
     }
 
     void initialize();

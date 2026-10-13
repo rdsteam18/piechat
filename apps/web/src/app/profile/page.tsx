@@ -27,10 +27,16 @@ export default function ProfilePage() {
     let active = true;
 
     async function loadProfile() {
-      const { data: authData, error: authError } =
-        await supabase.auth.getUser();
+      let authUser: { id: string } | null = null;
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData.session?.user) {
+        authUser = sessionData.session.user;
+      } else {
+        const { data: authData } = await supabase.auth.getUser();
+        if (authData?.user) authUser = authData.user;
+      }
 
-      if (authError || !authData.user) {
+      if (!authUser) {
         router.replace("/auth");
         return;
       }
@@ -38,7 +44,7 @@ export default function ProfilePage() {
       const { data, error } = await supabase
         .from("profiles")
         .select("username, display_name, bio")
-        .eq("id", authData.user.id)
+        .eq("id", authUser.id)
         .single();
 
       if (!active) return;
@@ -207,6 +213,22 @@ export default function ProfilePage() {
           {saving ? "Saving..." : "Save profile"}
         </button>
       </form>
+
+      <div className="mt-4 rounded-xl border p-4 bg-gray-50 dark:bg-zinc-900/50">
+        <h3 className="text-sm font-semibold mb-1">Install PieChat</h3>
+        <p className="text-xs text-gray-500 mb-3">
+          Install PieChat on your home screen or desktop for fast access and calling.
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            window.dispatchEvent(new Event("piechat-show-install-prompt"));
+          }}
+          className="rounded-lg border px-3 py-1.5 text-xs font-medium hover:bg-gray-100 dark:hover:bg-zinc-800 transition-colors"
+        >
+          📲 Install App / View Instructions
+        </button>
+      </div>
 
       {status && (
         <p role="status" aria-live="polite" className="mt-4 break-words rounded-lg border p-3 text-sm">

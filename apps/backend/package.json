@@ -7,7 +7,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/calling.test.ts"
   },
   "dependencies": {
     "@types/pg": "^8.23.1",
@@ -16,7 +17,8 @@
     "express": "5.1.0",
     "express-rate-limit": "^8.7.1",
     "helmet": "8.1.0",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "socket.io": "^4.8.4"
   },
   "devDependencies": {
     "@types/cors": "2.8.19",

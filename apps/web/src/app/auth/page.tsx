@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
@@ -9,6 +9,7 @@ type OAuthProvider = "google" | "github" | "linkedin_oidc" | "facebook";
 export default function AuthPage() {
   const router = useRouter();
 
+  const [checking, setChecking] = useState(true);
   const [mode, setMode] = useState<"signup" | "login">("signup");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
@@ -16,6 +17,31 @@ export default function AuthPage() {
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [oauthLoading, setOauthLoading] = useState<OAuthProvider | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session && active) {
+        router.replace("/dashboard");
+      } else if (active) {
+        setChecking(false);
+      }
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session && active) {
+        router.replace("/dashboard");
+      }
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [router]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -90,6 +116,14 @@ export default function AuthPage() {
       );
       setOauthLoading(null);
     }
+  }
+
+  if (checking) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-gray-50">
+        <div className="h-7 w-7 animate-spin rounded-full border-2 border-black border-t-transparent" />
+      </main>
+    );
   }
 
   return (
