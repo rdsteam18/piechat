@@ -123,6 +123,7 @@ export default function ChatWorkspace() {
   const [starredMessageIds, setStarredMessageIds] = useState<string[]>([]);
   const [pinnedMessageId, setPinnedMessageId] = useState<string | null>(null);
   const [openActionMenuMsgId, setOpenActionMenuMsgId] = useState<string | null>(null);
+  const [openReactionPickerMsgId, setOpenReactionPickerMsgId] = useState<string | null>(null);
 
   // Multiple Selection Mode
   const [selectionMode, setSelectionMode] = useState(false);
@@ -547,6 +548,25 @@ export default function ChatWorkspace() {
       void supabase.removeChannel(channel);
     };
   }, [selectedId, userId, loadReactionsAndReceipts, scrollToBottom]);
+
+  // Close reaction picker on outside click / escape
+  useEffect(() => {
+    if (!openReactionPickerMsgId) return;
+
+    function handleClickOutside() {
+      setOpenReactionPickerMsgId(null);
+    }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpenReactionPickerMsgId(null);
+    }
+
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openReactionPickerMsgId]);
 
   // Scheduled message dispatcher ticker
   useEffect(() => {
@@ -1352,6 +1372,22 @@ export default function ChatWorkspace() {
                     const isStarred = starredMessageIds.includes(message.id);
                     const isSelected = selectedMessageIds.includes(message.id);
 
+                    // Smart Message Editing Rule
+                    const messageReadCount = receipts.filter(
+                      (rc) => rc.message_id === message.id && !!rc.read_at && rc.user_id !== userId
+                    ).length;
+
+                    const canEditMessage = (() => {
+                      if (!mine || !!message.deleted_at) return false;
+                      if (selected.type === "direct") {
+                        // Direct chat: only editable if recipient hasn't read it
+                        return messageReadCount === 0;
+                      } else {
+                        // Group chat: editable if read by at most 2 members
+                        return messageReadCount <= 2;
+                      }
+                    })();
+
                     return (
                       <div
                         key={message.id}
@@ -1384,9 +1420,58 @@ export default function ChatWorkspace() {
                           </button>
                         )}
 
-                        {/* Message Bubble Container */}
+                        {/* WhatsApp-style Hover Reaction Trigger Button */}
+                        {!message.deleted_at && (
+                          <div
+                            className={`relative self-center hidden group-hover:flex items-center select-none ${
+                              mine ? "order-first" : "order-last"
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setOpenReactionPickerMsgId((prev) =>
+                                  prev === message.id ? null : message.id
+                                );
+                              }}
+                              className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--foreground)] hover:bg-[var(--background)] shadow-sm border border-[var(--border)] transition hover:scale-110"
+                              title="React"
+                              aria-label="React"
+                            >
+                              <Smile size={15} />
+                            </button>
+
+                            {/* Floating WhatsApp Quick Emoji Bar */}
+                            {openReactionPickerMsgId === message.id && (
+                              <div
+                                className={`absolute bottom-full mb-1.5 ${
+                                  mine ? "right-0" : "left-0"
+                                } z-40 flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-1 shadow-xl animate-fade-in`}
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                {QUICK_EMOJIS.map((emoji) => (
+                                  <button
+                                    key={emoji}
+                                    type="button"
+                                    onClick={() => {
+                                      void handleToggleReaction(message.id, emoji);
+                                      setOpenReactionPickerMsgId(null);
+                                    }}
+                                    className="flex h-7 w-7 items-center justify-center rounded-full text-base hover:scale-130 transition active:scale-95"
+                                    title={`React with ${emoji}`}
+                                  >
+                                    {emoji}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Message Bubble Container with pr-8 for top-right chevron */}
                         <div
-                          className={`relative max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 sm:max-w-[70%] shadow-sm transition ${
+                          className={`relative max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 sm:max-w-[70%] shadow-sm transition pr-8 ${
                             mine
                               ? "bg-[var(--primary)] text-white rounded-br-xs"
                               : "bg-[var(--surface)] text-[var(--foreground)] border border-[var(--border)] rounded-bl-xs"
@@ -1480,7 +1565,7 @@ export default function ChatWorkspace() {
 
                           {/* Reactions Badges */}
                           {Object.keys(reactionCounts).length > 0 && (
-                            <div className="mt-2 flex flex-wrap gap-1">
+                            <div className="mt-1.5 flex flex-wrap gap-1">
                               {Object.entries(reactionCounts).map(
                                 ([emoji, { count, reactedByMe }]) => (
                                   <button
@@ -1505,14 +1590,12 @@ export default function ChatWorkspace() {
                             </div>
                           )}
 
-                          {/* WhatsApp-style Hover Arrow / Trigger Dropdown */}
+                          {/* WhatsApp-style Inside Top-Right Dropdown Trigger */}
                           <div
-                            className={`absolute top-1.5 ${
-                              mine ? "-left-8" : "-right-8"
-                            } z-30 ${
+                            className={`absolute top-1.5 right-1.5 z-30 transition-opacity ${
                               openActionMenuMsgId === message.id
-                                ? "flex"
-                                : "hidden group-hover:flex"
+                                ? "flex opacity-100"
+                                : "hidden group-hover:flex opacity-90 hover:opacity-100"
                             }`}
                           >
                             <MessageActionMenu
@@ -1526,11 +1609,15 @@ export default function ChatWorkspace() {
                               onAction={(action) =>
                                 handleMessageAction(action, message)
                               }
-                              canEdit={mine && !message.deleted_at}
+                              onReaction={(emoji) =>
+                                void handleToggleReaction(message.id, emoji)
+                              }
+                              canEdit={canEditMessage}
                               canDelete={mine || isUserAdmin}
                               isStarred={isStarred}
                               isPinned={pinnedMessageId === message.id}
-                              align={mine ? "right" : "left"}
+                              align="right"
+                              isOwnMessage={mine}
                             />
                           </div>
                         </div>

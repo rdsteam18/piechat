@@ -28,6 +28,7 @@ export type MessageAction =
 
 type Props = {
   onAction: (action: MessageAction) => void;
+  onReaction?: (emoji: string) => void;
   canEdit?: boolean;
   canDelete?: boolean;
   isStarred?: boolean;
@@ -37,7 +38,10 @@ type Props = {
   onToggle?: () => void;
   onClose?: () => void;
   align?: "left" | "right";
+  isOwnMessage?: boolean;
 };
+
+const QUICK_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
 const actions: {
   id: MessageAction;
@@ -57,6 +61,7 @@ const actions: {
 
 export default function MessageActionMenu({
   onAction,
+  onReaction,
   canEdit = false,
   canDelete = false,
   isStarred = false,
@@ -66,6 +71,7 @@ export default function MessageActionMenu({
   onToggle,
   onClose,
   align = "right",
+  isOwnMessage = false,
 }: Props) {
   const [internalOpen, setInternalOpen] = useState(false);
   const open = isOpen !== undefined ? isOpen : internalOpen;
@@ -120,20 +126,24 @@ export default function MessageActionMenu({
 
   return (
     <div ref={rootRef} className="relative inline-flex items-center">
-      {/* WhatsApp Dropdown Trigger Button */}
+      {/* WhatsApp Inside-Bubble Dropdown Trigger Button */}
       <button
         type="button"
         aria-label={triggerLabel}
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={handleToggle}
-        className="flex h-6 w-6 items-center justify-center rounded-full
-          bg-[var(--surface)] text-[var(--foreground)]
-          shadow-md ring-1 ring-[var(--border)]
-          hover:bg-[var(--background)] hover:scale-105
-          focus-visible:outline-2 focus-visible:outline-offset-2 transition"
+        className={`flex h-5 w-5 items-center justify-center rounded-full transition-all focus-visible:outline-2 ${
+          isOwnMessage
+            ? open
+              ? "bg-black/35 text-white"
+              : "bg-black/20 text-white/90 hover:bg-black/30 hover:text-white"
+            : open
+            ? "bg-black/20 text-[var(--foreground)]"
+            : "bg-black/5 text-[var(--foreground)]/70 hover:bg-black/15 hover:text-[var(--foreground)]"
+        }`}
       >
-        {open ? <X size={13} /> : <ChevronDown size={14} />}
+        {open ? <X size={12} strokeWidth={2.5} /> : <ChevronDown size={13} strokeWidth={2.5} />}
       </button>
 
       {/* Action Menu Popup */}
@@ -143,11 +153,31 @@ export default function MessageActionMenu({
           aria-label="Message actions"
           className={`absolute ${
             align === "right" ? "right-0" : "left-0"
-          } top-7 z-50 w-[min(280px,calc(100vw-32px))]
+          } top-6 z-50 w-[min(280px,calc(100vw-32px))]
             rounded-2xl border border-[var(--border)]
             bg-[var(--surface)] p-2.5 shadow-2xl animate-fade-in`}
           onClick={(e) => e.stopPropagation()}
         >
+          {/* Quick Emoji Reactions Row */}
+          {onReaction && (
+            <div className="flex items-center justify-between gap-1 border-b border-[var(--border)] pb-2 mb-2 px-1">
+              {QUICK_EMOJIS.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  onClick={() => {
+                    handleClose();
+                    onReaction(emoji);
+                  }}
+                  className="flex h-8 w-8 items-center justify-center rounded-full text-base hover:scale-130 hover:bg-[var(--background)] transition-transform active:scale-95"
+                  title={`React with ${emoji}`}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="grid grid-cols-3 gap-1.5">
             {actions.map(({ id, label, Icon }) => {
               if (id === "edit" && !canEdit) return null;
