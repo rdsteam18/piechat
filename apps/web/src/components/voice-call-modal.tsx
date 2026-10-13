@@ -68,6 +68,9 @@ function getIceServers(): RTCConfiguration {
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
       { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+      { urls: "stun:global.stun.twilio.com:3478" },
     ],
   };
 }
@@ -184,6 +187,21 @@ export default function VoiceCallModal({
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const ringingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const callStartTimeRef = useRef<number | null>(null);
+  const iceCandidatesQueueRef = useRef<RTCIceCandidateInit[]>([]);
+
+  // Drain buffered ICE candidates once remote description is set
+  const drainIceCandidates = useCallback(async (pc: RTCPeerConnection) => {
+    while (iceCandidatesQueueRef.current.length > 0) {
+      const cand = iceCandidatesQueueRef.current.shift();
+      if (cand) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
+        } catch (err) {
+          console.warn("Error adding queued ICE candidate:", err);
+        }
+      }
+    }
+  }, []);
 
   // Play ringing sound on outgoing/incoming state
   useEffect(() => {
@@ -225,6 +243,7 @@ export default function VoiceCallModal({
 
   // Teardown everything
   const cleanupMediaAndPeer = useCallback(() => {
+    iceCandidatesQueueRef.current = [];
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -363,7 +382,11 @@ export default function VoiceCallModal({
 
   // Initiator Start Call Flow
   const startOutgoingCall = useCallback(async () => {
-    if (!recipient) return;
+    if (!recipient) {
+      setErrorMessage("Recipient could not be found.");
+      setCallStatus("failed");
+      return;
+    }
 
     try {
       // 1. Audio-only media request (never video)
@@ -373,26 +396,29 @@ export default function VoiceCallModal({
       });
       localStreamRef.current = stream;
 
-      // 2. Persist call record in Supabase
-      const { data: callData, error: callError } = await supabase
-        .from("calls")
-        .insert({
-          conversation_id: conversationId,
-          caller_id: currentUserId,
-          recipient_id: recipient.id,
-          status: "ringing",
-        })
-        .select("id")
-        .single();
+      // 2. Persist call record in Supabase (with safe fallback so call is never aborted)
+      let newCallId = crypto.randomUUID();
+      try {
+        const { data: callData, error: callError } = await supabase
+          .from("calls")
+          .insert({
+            conversation_id: conversationId,
+            caller_id: currentUserId,
+            recipient_id: recipient.id,
+            status: "ringing",
+          })
+          .select("id")
+          .single();
 
-      if (callError || !callData) {
-        setErrorMessage("Failed to initiate call");
-        setCallStatus("failed");
-        cleanupMediaAndPeer();
-        return;
+        if (callData?.id) {
+          newCallId = callData.id;
+        } else if (callError) {
+          console.warn("Call logging warning (continuing call p2p):", callError.message);
+        }
+      } catch (dbErr) {
+        console.warn("DB logging fallback:", dbErr);
       }
 
-      const newCallId = callData.id;
       setCallId(newCallId);
 
       // 3. Create WebRTC Peer Connection
@@ -425,27 +451,32 @@ export default function VoiceCallModal({
         });
       }
 
-      // Also send to recipient's direct notification channel
-      const recipientChannel = supabase.channel(`user-calls-${recipient.id}`, {
-        config: { broadcast: { self: false } },
-      });
-      recipientChannel.subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          recipientChannel.send({
-            type: "broadcast",
-            event: "incoming_call",
-            payload: offerPayload,
-          });
-        }
-      });
+      // Also send directly to recipient's notification channel
+      const sendDirectNotification = () => {
+        const recipientChannel = supabase.channel(`user-calls-${recipient.id}`, {
+          config: { broadcast: { self: false } },
+        });
+        recipientChannel.subscribe((status) => {
+          if (status === "SUBSCRIBED") {
+            recipientChannel.send({
+              type: "broadcast",
+              event: "incoming_call",
+              payload: offerPayload,
+            });
+          }
+        });
+      };
+      sendDirectNotification();
+      // Retry once after 1.5s in case recipient just loaded page
+      setTimeout(sendDirectNotification, 1500);
 
       setCallStatus("ringing");
 
-      // 6. Ringing timeout (30 seconds) -> missed call if no response
+      // 6. Ringing timeout (35 seconds) -> missed call if no response
       ringingTimeoutRef.current = setTimeout(async () => {
         setErrorMessage("No answer");
         await handleEndCall("missed");
-      }, 30000);
+      }, 35000);
     } catch (err: unknown) {
       console.error("Microphone or WebRTC initiation error:", err);
       const isPermissionDenied =
@@ -499,6 +530,9 @@ export default function VoiceCallModal({
         new RTCSessionDescription(incomingOfferData.sdp)
       );
 
+      // Drain any early buffered candidates
+      await drainIceCandidates(pc);
+
       // 4. Create SDP Answer
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -516,6 +550,25 @@ export default function VoiceCallModal({
           },
         });
       }
+
+      // Also send to caller's direct channel
+      const callerDirectChannel = supabase.channel(`user-calls-${incomingOfferData.callerId}`, {
+        config: { broadcast: { self: false } },
+      });
+      callerDirectChannel.subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          callerDirectChannel.send({
+            type: "broadcast",
+            event: "call_signal",
+            payload: {
+              type: "call_answer",
+              callId: activeCallId,
+              senderId: currentUserId,
+              sdp: answer,
+            },
+          });
+        }
+      });
 
       // 6. Update call record in Supabase
       await updateCallRecord(activeCallId, {
@@ -593,6 +646,7 @@ export default function VoiceCallModal({
               await peerConnectionRef.current.setRemoteDescription(
                 new RTCSessionDescription(signal.sdp)
               );
+              await drainIceCandidates(peerConnectionRef.current);
               setCallStatus("accepted");
               if (!callStartTimeRef.current) {
                 callStartTimeRef.current = Date.now();
@@ -606,9 +660,13 @@ export default function VoiceCallModal({
           case "call_candidate":
             if (peerConnectionRef.current && signal.candidate) {
               try {
-                await peerConnectionRef.current.addIceCandidate(
-                  new RTCIceCandidate(signal.candidate)
-                );
+                if (peerConnectionRef.current.remoteDescription) {
+                  await peerConnectionRef.current.addIceCandidate(
+                    new RTCIceCandidate(signal.candidate)
+                  );
+                } else {
+                  iceCandidatesQueueRef.current.push(signal.candidate);
+                }
               } catch (e) {
                 console.warn("Failed to add ICE candidate:", e);
               }
