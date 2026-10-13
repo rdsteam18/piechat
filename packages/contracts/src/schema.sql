@@ -245,21 +245,51 @@ create or replace function public.respond_to_friend_request(
 )
 returns void
 language plpgsql
-security invoker
-set search_path = ''
+security definer
+set search_path = public, auth
 as $$
+declare
+  v_requester_id uuid;
+  v_addressee_id uuid;
+  v_conv_id uuid;
 begin
+  select requester_id, addressee_id
+  into v_requester_id, v_addressee_id
+  from public.friendships
+  where id = request_id
+    and addressee_id = auth.uid()
+    and status = 'pending';
+
+  if not found then
+    raise exception 'Request not found or already handled';
+  end if;
+
   update public.friendships
   set status = case
     when accept_request then 'accepted'
     else 'rejected'
   end
-  where id = request_id
-    and addressee_id = (select auth.uid())
-    and status = 'pending';
+  where id = request_id;
 
-  if not found then
-    raise exception 'Request not found or already handled';
+  if accept_request then
+    select c.id into v_conv_id
+    from public.conversations c
+    join public.conversation_members cm1 on cm1.conversation_id = c.id and cm1.user_id = v_requester_id
+    join public.conversation_members cm2 on cm2.conversation_id = c.id and cm2.user_id = v_addressee_id
+    where c.type = 'direct'
+    limit 1;
+
+    if v_conv_id is null then
+      insert into public.conversations (type, created_by)
+      values ('direct', v_addressee_id)
+      returning id into v_conv_id;
+
+      insert into public.conversation_members (conversation_id, user_id, role)
+      values
+        (v_conv_id, v_requester_id, 'member'),
+        (v_conv_id, v_addressee_id, 'member')
+      on conflict do nothing;
+    end if;
   end if;
 end;
 $$;
