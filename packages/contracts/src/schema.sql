@@ -312,3 +312,61 @@ with check (
   and status in ('accepted', 'rejected')
 );
 
+-- ========================================================
+-- STEP 12: Realtime & Non-recursive Conversation Membership
+-- ========================================================
+
+create or replace function public.is_conversation_member(p_conv_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public, auth
+as $$
+  select exists (
+    select 1
+    from public.conversation_members
+    where conversation_id = p_conv_id
+      and user_id = auth.uid()
+  );
+$$;
+
+revoke all on function public.is_conversation_member(uuid) from public, anon;
+grant execute on function public.is_conversation_member(uuid) to authenticated;
+
+drop policy if exists "conversations_select_members" on public.conversations;
+create policy "conversations_select_members"
+on public.conversations
+for select to authenticated
+using (
+  public.is_conversation_member(id)
+);
+
+drop policy if exists "members_select_same_conversation" on public.conversation_members;
+create policy "members_select_same_conversation"
+on public.conversation_members
+for select to authenticated
+using (
+  public.is_conversation_member(conversation_id)
+);
+
+drop policy if exists "messages_select_members" on public.messages;
+create policy "messages_select_members"
+on public.messages
+for select to authenticated
+using (
+  public.is_conversation_member(conversation_id)
+);
+
+drop policy if exists "messages_insert_as_member" on public.messages;
+create policy "messages_insert_as_member"
+on public.messages
+for insert to authenticated
+with check (
+  sender_id = (select auth.uid())
+  and public.is_conversation_member(conversation_id)
+);
+
+-- Realtime publication for messages
+alter table public.messages replica identity full;
+alter publication supabase_realtime add table public.messages;
+
