@@ -70,6 +70,13 @@ export default function DashboardPage() {
       </button>
 
       <button
+        onClick={() => router.push("/friends")}
+        className="mt-6 mr-3 rounded-lg border px-5 py-3 font-medium hover:bg-gray-50"
+      >
+        Find friends
+      </button>
+
+      <button
         onClick={handleLogout}
         className="mt-6 rounded-lg bg-black px-5 py-3 text-white"
       >

@@ -220,3 +220,65 @@ create trigger on_auth_user_created
 after insert on auth.users
 for each row
 execute function public.handle_new_user();
+
+-- ========================================================
+-- STEP 9: Friend Request Security & Resolution Function
+-- ========================================================
+
+drop policy if exists "friendships_update_participants"
+on public.friendships;
+
+drop policy if exists "friendships_insert_requester"
+on public.friendships;
+
+create policy "friendships_insert_pending_request"
+on public.friendships
+for insert to authenticated
+with check (
+  requester_id = (select auth.uid())
+  and status = 'pending'
+);
+
+create or replace function public.respond_to_friend_request(
+  request_id uuid,
+  accept_request boolean
+)
+returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  update public.friendships
+  set status = case
+    when accept_request then 'accepted'
+    else 'rejected'
+  end
+  where id = request_id
+    and addressee_id = (select auth.uid())
+    and status = 'pending';
+
+  if not found then
+    raise exception 'Request not found or already handled';
+  end if;
+end;
+$$;
+
+revoke all on function public.respond_to_friend_request(uuid, boolean)
+from public, anon;
+
+grant execute on function public.respond_to_friend_request(uuid, boolean)
+to authenticated;
+
+create policy "friendships_receiver_respond"
+on public.friendships
+for update to authenticated
+using (
+  addressee_id = (select auth.uid())
+  and status = 'pending'
+)
+with check (
+  addressee_id = (select auth.uid())
+  and status in ('accepted', 'rejected')
+);
+
