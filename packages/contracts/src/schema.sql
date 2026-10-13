@@ -603,3 +603,159 @@ $$;
 revoke all on function public.remove_group_member(uuid, uuid) from public, anon;
 grant execute on function public.remove_group_member(uuid, uuid) to authenticated;
 
+-- ========================================================
+-- STEP 16 & 17: Receipts, Reactions, and Read Status
+-- ========================================================
+
+-- 1. Message Receipts Table
+create table if not exists public.message_receipts (
+  message_id uuid not null references public.messages(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  delivered_at timestamptz,
+  read_at timestamptz,
+  primary key (message_id, user_id)
+);
+
+alter table public.message_receipts enable row level security;
+
+drop policy if exists "receipts_select_members" on public.message_receipts;
+create policy "receipts_select_members" on public.message_receipts
+for select to authenticated
+using (
+  exists (
+    select 1 from public.messages m
+    where m.id = message_receipts.message_id
+      and public.is_conversation_member(m.conversation_id)
+  )
+);
+
+drop policy if exists "receipts_insert_self" on public.message_receipts;
+create policy "receipts_insert_self" on public.message_receipts
+for insert to authenticated
+with check (
+  user_id = auth.uid()
+  and exists (
+    select 1 from public.messages m
+    where m.id = message_receipts.message_id
+      and public.is_conversation_member(m.conversation_id)
+  )
+);
+
+drop policy if exists "receipts_update_self" on public.message_receipts;
+create policy "receipts_update_self" on public.message_receipts
+for update to authenticated
+using (user_id = auth.uid())
+with check (user_id = auth.uid());
+
+-- Mark messages read RPC
+create or replace function public.mark_messages_read(p_conversation_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+begin
+  if v_user_id is null or not public.is_conversation_member(p_conversation_id) then
+    return;
+  end if;
+
+  insert into public.message_receipts (message_id, user_id, read_at, delivered_at)
+  select m.id, v_user_id, now(), now()
+  from public.messages m
+  where m.conversation_id = p_conversation_id
+    and m.sender_id <> v_user_id
+  on conflict (message_id, user_id)
+  do update set
+    read_at = coalesce(message_receipts.read_at, excluded.read_at),
+    delivered_at = coalesce(message_receipts.delivered_at, excluded.delivered_at);
+end;
+$$;
+
+revoke all on function public.mark_messages_read(uuid) from public, anon;
+grant execute on function public.mark_messages_read(uuid) to authenticated;
+
+-- 2. Message Reactions Table
+create table if not exists public.message_reactions (
+  message_id uuid not null references public.messages(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  emoji text not null,
+  created_at timestamptz not null default now(),
+  primary key (message_id, user_id, emoji),
+  constraint message_reactions_emoji_length check (char_length(emoji) between 1 and 32)
+);
+
+create index if not exists message_reactions_message_id_idx on public.message_reactions(message_id);
+
+alter table public.message_reactions enable row level security;
+
+drop policy if exists "reactions_select_members" on public.message_reactions;
+create policy "reactions_select_members" on public.message_reactions
+for select to authenticated
+using (
+  exists (
+    select 1 from public.messages m
+    where m.id = message_reactions.message_id
+      and public.is_conversation_member(m.conversation_id)
+  )
+);
+
+drop policy if exists "reactions_insert_self" on public.message_reactions;
+create policy "reactions_insert_self" on public.message_reactions
+for insert to authenticated
+with check (
+  user_id = auth.uid()
+  and exists (
+    select 1 from public.messages m
+    where m.id = message_reactions.message_id
+      and public.is_conversation_member(m.conversation_id)
+  )
+);
+
+drop policy if exists "reactions_delete_self" on public.message_reactions;
+create policy "reactions_delete_self" on public.message_reactions
+for delete to authenticated
+using (user_id = auth.uid());
+
+-- Toggle Reaction RPC
+create or replace function public.toggle_message_reaction(p_message_id uuid, p_emoji text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_exists boolean;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select exists(
+    select 1 from public.message_reactions
+    where message_id = p_message_id and user_id = v_user_id and emoji = p_emoji
+  ) into v_exists;
+
+  if v_exists then
+    delete from public.message_reactions
+    where message_id = p_message_id and user_id = v_user_id and emoji = p_emoji;
+    return false;
+  else
+    insert into public.message_reactions (message_id, user_id, emoji)
+    values (p_message_id, v_user_id, p_emoji)
+    on conflict do nothing;
+    return true;
+  end if;
+end;
+$$;
+
+revoke all on function public.toggle_message_reaction(uuid, text) from public, anon;
+grant execute on function public.toggle_message_reaction(uuid, text) to authenticated;
+
+alter table public.message_reactions replica identity full;
+alter publication supabase_realtime add table public.message_reactions;
+alter table public.message_receipts replica identity full;
+alter publication supabase_realtime add table public.message_receipts;
+

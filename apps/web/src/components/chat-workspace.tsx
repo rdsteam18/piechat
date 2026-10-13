@@ -25,6 +25,8 @@ type Message = {
   sender_id: string;
   message_type: string;
   content: string | null;
+  reply_to_id?: string | null;
+  edited_at?: string | null;
   created_at: string;
   deleted_at: string | null;
 };
@@ -33,13 +35,32 @@ type ScheduledItem = {
   id: string;
   conversation_id: string;
   content: string;
-  scheduledTime: number; // timestamp ms
+  scheduledTime: number;
 };
+
+type Reaction = {
+  message_id: string;
+  user_id: string;
+  emoji: string;
+};
+
+type Receipt = {
+  message_id: string;
+  user_id: string;
+  delivered_at: string | null;
+  read_at: string | null;
+};
+
+const QUICK_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+const EMOJI_PICKER_LIST = [
+  "😀", "😂", "😍", "🥰", "😎", "🥳", "🤔", "😭", "😡", "🤯",
+  "👍", "👎", "👏", "🙌", "🙏", "🤝", "💪", "✌️", "👋", "🔥",
+  "❤️", "✨", "🎉", "🚀", "💯", "⭐", "🍕", "☕", "💻", "📚"
+];
 
 export default function ChatWorkspace() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const initialConversationParam = searchParams.get("conversationId");
 
   const [userId, setUserId] = useState("");
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -59,22 +80,37 @@ export default function ChatWorkspace() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
 
-  // Step 14: Group Management State
+  // Group Management
   const [showCreateGroup, setShowCreateGroup] = useState(false);
-  const [groupTitleDraft, setGroupTitleDraft] = useState("");
-  const [selectedFriendIds, setSelectedFriendIds] = useState<string[]>([]);
   const [acceptedFriends, setAcceptedFriends] = useState<Profile[]>([]);
   const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [showAddMembers, setShowAddMembers] = useState(false);
   const [groupActionLoading, setGroupActionLoading] = useState(false);
 
-  // Message Scheduling State
+  // Message Scheduling
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledItems, setScheduledItems] = useState<ScheduledItem[]>([]);
 
-  // Step 12: In-memory client cache
+  // Step 15: Reply, Edit, Star, Actions Menu
+  const [replyingTo, setReplyingTo] = useState<{
+    id: string;
+    content: string;
+    senderName: string;
+  } | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [starredMessageIds, setStarredMessageIds] = useState<string[]>([]);
+  const [activeMenuMessageId, setActiveMenuMessageId] = useState<string | null>(null);
+
+  // Step 16 & 17: Reactions and Receipts
+  const [reactions, setReactions] = useState<Reaction[]>([]);
+  const [receipts, setReceipts] = useState<Receipt[]>([]);
+  const [infoMessage, setInfoMessage] = useState<Message | null>(null);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+
+  // Cache & Rate Limit
   const messagesCacheRef = useRef<Record<string, Message[]>>({});
+  const recentSendTimestampsRef = useRef<number[]>([]);
 
   // Realtime typing
   const [typingUsers, setTypingUsers] = useState<
@@ -83,10 +119,7 @@ export default function ChatWorkspace() {
   const lastTypingBroadcastRef = useRef<number>(0);
   const typingChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
-  // Rate limiting tracker
-  const recentSendTimestampsRef = useRef<number[]>([]);
-
-  // Auto-scroll
+  // Auto-scroll anchor
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const scrollToBottom = useCallback(() => {
@@ -121,7 +154,7 @@ export default function ChatWorkspace() {
       if (peopleError) throw peopleError;
       setAcceptedFriends((people ?? []) as Profile[]);
     } catch {
-      // Non-critical, graceful fallback
+      // Non-critical fallback
     }
   }, []);
 
@@ -158,16 +191,13 @@ export default function ChatWorkspace() {
       setConversations(list);
 
       const requestedId = searchParams.get("conversationId");
-
       setSelectedId((previous) => {
         if (requestedId && list.some((item) => item.id === requestedId)) {
           return requestedId;
         }
-
         if (list.some((item) => item.id === previous)) {
           return previous;
         }
-
         return list[0]?.id ?? "";
       });
 
@@ -224,10 +254,39 @@ export default function ChatWorkspace() {
     }
   }, [searchParams, conversations]);
 
+  // Load Reactions and Receipts for current messages
+  const loadReactionsAndReceipts = useCallback(async (msgIds: string[]) => {
+    if (msgIds.length === 0) {
+      setReactions([]);
+      setReceipts([]);
+      return;
+    }
+
+    try {
+      const [reactionsRes, receiptsRes] = await Promise.all([
+        supabase
+          .from("message_reactions")
+          .select("message_id, user_id, emoji")
+          .in("message_id", msgIds),
+        supabase
+          .from("message_receipts")
+          .select("message_id, user_id, delivered_at, read_at")
+          .in("message_id", msgIds),
+      ]);
+
+      if (reactionsRes.data) setReactions(reactionsRes.data as Reaction[]);
+      if (receiptsRes.data) setReceipts(receiptsRes.data as Receipt[]);
+    } catch {
+      // Non-critical
+    }
+  }, []);
+
   const loadMessages = useCallback(
     async (conversationId: string) => {
       if (!conversationId) {
         setMessages([]);
+        setReactions([]);
+        setReceipts([]);
         return;
       }
 
@@ -238,7 +297,7 @@ export default function ChatWorkspace() {
       const { data, error: messageError } = await supabase
         .from("messages")
         .select(
-          "id,conversation_id,sender_id,message_type,content,created_at,deleted_at"
+          "id,conversation_id,sender_id,message_type,content,reply_to_id,edited_at,created_at,deleted_at"
         )
         .eq("conversation_id", conversationId)
         .order("created_at", { ascending: true })
@@ -249,12 +308,21 @@ export default function ChatWorkspace() {
       const freshList = (data ?? []) as Message[];
       messagesCacheRef.current[conversationId] = freshList;
       setMessages(freshList);
+
+      const msgIds = freshList.map((m) => m.id);
+      void loadReactionsAndReceipts(msgIds);
+
+      // Step 16: Mark messages as read for this conversation
+      void supabase.rpc("mark_messages_read", {
+        p_conversation_id: conversationId,
+      });
+
       setTimeout(scrollToBottom, 50);
     },
-    [scrollToBottom]
+    [loadReactionsAndReceipts, scrollToBottom]
   );
 
-  // Initialize
+  // Initialize Auth & Workspace
   useEffect(() => {
     let active = true;
 
@@ -300,7 +368,7 @@ export default function ChatWorkspace() {
     };
   }, [loadConversations, loadFriends, router]);
 
-  // Selected conversation changed
+  // Selected conversation change
   useEffect(() => {
     if (!selectedId) {
       setMessages([]);
@@ -327,7 +395,7 @@ export default function ChatWorkspace() {
     };
   }, [selectedId, loadMessages]);
 
-  // Realtime subscription
+  // Realtime subscription: Messages, Reactions, Receipts, Typing
   useEffect(() => {
     if (!selectedId || !userId) return;
 
@@ -355,6 +423,10 @@ export default function ChatWorkspace() {
             messagesCacheRef.current[selectedId] = updated;
             return updated;
           });
+          // Mark read immediately
+          void supabase.rpc("mark_messages_read", {
+            p_conversation_id: selectedId,
+          });
           setTimeout(scrollToBottom, 50);
         }
       )
@@ -375,6 +447,34 @@ export default function ChatWorkspace() {
             messagesCacheRef.current[selectedId] = next;
             return next;
           });
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "message_reactions",
+        },
+        () => {
+          const msgIds = (messagesCacheRef.current[selectedId] ?? []).map(
+            (m) => m.id
+          );
+          void loadReactionsAndReceipts(msgIds);
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "message_receipts",
+        },
+        () => {
+          const msgIds = (messagesCacheRef.current[selectedId] ?? []).map(
+            (m) => m.id
+          );
+          void loadReactionsAndReceipts(msgIds);
         }
       )
       .on("broadcast", { event: "typing" }, ({ payload }) => {
@@ -415,7 +515,7 @@ export default function ChatWorkspace() {
       typingChannelRef.current = null;
       void supabase.removeChannel(channel);
     };
-  }, [selectedId, userId, scrollToBottom]);
+  }, [selectedId, userId, loadReactionsAndReceipts, scrollToBottom]);
 
   // Scheduled message dispatcher ticker
   useEffect(() => {
@@ -423,7 +523,9 @@ export default function ChatWorkspace() {
 
     const timer = setInterval(async () => {
       const now = Date.now();
-      const readyToSend = scheduledItems.filter((item) => item.scheduledTime <= now);
+      const readyToSend = scheduledItems.filter(
+        (item) => item.scheduledTime <= now
+      );
 
       if (readyToSend.length === 0) return;
 
@@ -443,7 +545,7 @@ export default function ChatWorkspace() {
             await loadMessages(selectedId);
           }
         } catch {
-          // Scheduled item execution error
+          // fallback
         }
       }
     }, 1000);
@@ -494,6 +596,7 @@ export default function ChatWorkspace() {
     return true;
   }
 
+  // Send or Edit Message
   async function sendMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -506,17 +609,51 @@ export default function ChatWorkspace() {
     setError("");
 
     try {
-      const { error: insertError } = await supabase.from("messages").insert({
-        conversation_id: selectedId,
-        sender_id: userId,
-        message_type: "text",
-        content,
-      });
+      if (editingMessageId) {
+        // Step 15: Edit existing message
+        const { error: editError } = await supabase
+          .from("messages")
+          .update({
+            content,
+            edited_at: new Date().toISOString(),
+          })
+          .eq("id", editingMessageId)
+          .eq("sender_id", userId);
 
-      if (insertError) throw insertError;
+        if (editError) throw editError;
 
-      setDraft("");
-      await loadMessages(selectedId);
+        setEditingMessageId(null);
+        setDraft("");
+        await loadMessages(selectedId);
+      } else {
+        // New Message (optionally with reply_to_id)
+        const payload: {
+          conversation_id: string;
+          sender_id: string;
+          message_type: string;
+          content: string;
+          reply_to_id?: string;
+        } = {
+          conversation_id: selectedId,
+          sender_id: userId,
+          message_type: "text",
+          content,
+        };
+
+        if (replyingTo) {
+          payload.reply_to_id = replyingTo.id;
+        }
+
+        const { error: insertError } = await supabase
+          .from("messages")
+          .insert(payload);
+
+        if (insertError) throw insertError;
+
+        setDraft("");
+        setReplyingTo(null);
+        await loadMessages(selectedId);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Message could not be sent.");
     } finally {
@@ -524,9 +661,10 @@ export default function ChatWorkspace() {
     }
   }
 
-  // Delete message action
+  // Delete message
   async function handleDeleteMessage(messageId: string) {
     setError("");
+    setActiveMenuMessageId(null);
     try {
       const { error: updateError } = await supabase
         .from("messages")
@@ -537,12 +675,45 @@ export default function ChatWorkspace() {
 
       setMessages((current) =>
         current.map((m) =>
-          m.id === messageId ? { ...m, deleted_at: new Date().toISOString() } : m
+          m.id === messageId
+            ? { ...m, deleted_at: new Date().toISOString() }
+            : m
         )
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not delete message.");
     }
+  }
+
+  // Toggle Reaction RPC
+  async function handleToggleReaction(messageId: string, emoji: string) {
+    setActiveMenuMessageId(null);
+    try {
+      await supabase.rpc("toggle_message_reaction", {
+        p_message_id: messageId,
+        p_emoji: emoji,
+      });
+      const msgIds = messages.map((m) => m.id);
+      void loadReactionsAndReceipts(msgIds);
+    } catch {
+      // non-critical
+    }
+  }
+
+  // Copy Message Content
+  function handleCopyMessage(content: string) {
+    setActiveMenuMessageId(null);
+    void navigator.clipboard.writeText(content);
+  }
+
+  // Toggle Star
+  function handleToggleStar(messageId: string) {
+    setActiveMenuMessageId(null);
+    setStarredMessageIds((prev) =>
+      prev.includes(messageId)
+        ? prev.filter((id) => id !== messageId)
+        : [...prev, messageId]
+    );
   }
 
   // Schedule message handler
@@ -572,47 +743,7 @@ export default function ChatWorkspace() {
     setScheduledDate("");
   }
 
-  // Create Group RPC
-  async function handleCreateGroup(e: React.FormEvent) {
-    e.preventDefault();
-    const title = groupTitleDraft.trim();
-    if (!title) {
-      setError("Please enter a group name.");
-      return;
-    }
-    if (selectedFriendIds.length === 0) {
-      setError("Select at least one friend to add to the group.");
-      return;
-    }
-
-    setGroupActionLoading(true);
-    setError("");
-
-    try {
-      const { data: convId, error: rpcError } = await supabase.rpc(
-        "create_group_conversation",
-        {
-          group_title: title,
-          member_ids: selectedFriendIds,
-        }
-      );
-
-      if (rpcError) throw rpcError;
-
-      setShowCreateGroup(false);
-      setGroupTitleDraft("");
-      setSelectedFriendIds([]);
-
-      await loadConversations(userId);
-      if (convId) setSelectedId(convId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not create group.");
-    } finally {
-      setGroupActionLoading(false);
-    }
-  }
-
-  // Add members to existing group
+  // Group Member Management
   async function handleAddMembers(friendIds: string[]) {
     if (!selectedId || friendIds.length === 0) return;
     setGroupActionLoading(true);
@@ -633,7 +764,6 @@ export default function ChatWorkspace() {
     }
   }
 
-  // Remove member / leave group
   async function handleRemoveMember(targetUserId: string) {
     if (!selectedId) return;
     setGroupActionLoading(true);
@@ -646,7 +776,6 @@ export default function ChatWorkspace() {
       if (rpcError) throw rpcError;
 
       if (targetUserId === userId) {
-        // User left the group
         setShowGroupInfo(false);
         setSelectedId("");
       }
@@ -711,14 +840,12 @@ export default function ChatWorkspace() {
           <div className="border-b border-[var(--border)] p-5">
             <div className="flex items-center justify-between">
               <span className="text-xl font-bold tracking-tight">PieChat</span>
-              <div className="flex items-center gap-3">
-                <button
-                  className="text-sm font-medium text-[var(--primary)] hover:underline"
-                  onClick={() => router.push("/profile")}
-                >
-                  Profile
-                </button>
-              </div>
+              <button
+                className="text-sm font-medium text-[var(--primary)] hover:underline"
+                onClick={() => router.push("/profile")}
+              >
+                Profile
+              </button>
             </div>
             <p className="mt-2 truncate text-sm text-[var(--muted)]">
               {profile?.display_name || profile?.username || "Your account"}
@@ -846,10 +973,11 @@ export default function ChatWorkspace() {
           className={`${
             selectedId ? "flex" : "hidden md:flex"
           } min-w-0 flex-1 flex-col`}
+          onClick={() => setActiveMenuMessageId(null)}
         >
           {selected ? (
             <>
-              {/* Chat Header */}
+              {/* Header */}
               <header className="flex min-h-[72px] items-center justify-between border-b border-[var(--border)] px-4 sm:px-6">
                 <div
                   className="flex items-center gap-3 min-w-0 cursor-pointer"
@@ -913,6 +1041,45 @@ export default function ChatWorkspace() {
                       senderProfile?.username ||
                       "User";
 
+                    // Quoted message if replied
+                    const quoted = message.reply_to_id
+                      ? messages.find((m) => m.id === message.reply_to_id)
+                      : null;
+                    const quotedSender = quoted
+                      ? members[quoted.sender_id]?.display_name || "User"
+                      : "";
+
+                    // Reactions on this message
+                    const msgReactions = reactions.filter(
+                      (r) => r.message_id === message.id
+                    );
+                    const reactionCounts: Record<
+                      string,
+                      { count: number; reactedByMe: boolean }
+                    > = {};
+                    for (const r of msgReactions) {
+                      if (!reactionCounts[r.emoji]) {
+                        reactionCounts[r.emoji] = {
+                          count: 0,
+                          reactedByMe: false,
+                        };
+                      }
+                      reactionCounts[r.emoji].count += 1;
+                      if (r.user_id === userId) {
+                        reactionCounts[r.emoji].reactedByMe = true;
+                      }
+                    }
+
+                    // Read Receipts for mine
+                    const msgReceipts = receipts.filter(
+                      (rc) => rc.message_id === message.id
+                    );
+                    const hasRead = msgReceipts.some((rc) => !!rc.read_at);
+                    const hasDelivered = msgReceipts.some(
+                      (rc) => !!rc.delivered_at
+                    );
+                    const isStarred = starredMessageIds.includes(message.id);
+
                     return (
                       <div
                         key={message.id}
@@ -920,6 +1087,92 @@ export default function ChatWorkspace() {
                           mine ? "justify-end" : "justify-start"
                         }`}
                       >
+                        {/* Hover Quick Action Menu */}
+                        <div
+                          className={`absolute -top-7 ${
+                            mine ? "right-2" : "left-2"
+                          } z-10 hidden items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 shadow-sm group-hover:flex`}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {/* Quick Reactions */}
+                          {QUICK_EMOJIS.slice(0, 4).map((emoji) => (
+                            <button
+                              key={emoji}
+                              onClick={() =>
+                                void handleToggleReaction(message.id, emoji)
+                              }
+                              className="text-xs hover:scale-125 transition"
+                            >
+                              {emoji}
+                            </button>
+                          ))}
+                          <span className="mx-0.5 text-gray-300">|</span>
+                          {/* Reply */}
+                          <button
+                            onClick={() =>
+                              setReplyingTo({
+                                id: message.id,
+                                content: message.content || "",
+                                senderName,
+                              })
+                            }
+                            title="Reply"
+                            className="text-xs hover:text-[var(--primary)]"
+                          >
+                            ↩️
+                          </button>
+                          {/* Copy */}
+                          {message.content && (
+                            <button
+                              onClick={() => handleCopyMessage(message.content!)}
+                              title="Copy"
+                              className="text-xs hover:text-[var(--primary)]"
+                            >
+                              📋
+                            </button>
+                          )}
+                          {/* Star */}
+                          <button
+                            onClick={() => handleToggleStar(message.id)}
+                            title={isStarred ? "Unstar" : "Star"}
+                            className="text-xs hover:text-amber-500"
+                          >
+                            {isStarred ? "⭐" : "☆"}
+                          </button>
+                          {/* Info */}
+                          <button
+                            onClick={() => setInfoMessage(message)}
+                            title="Message Info"
+                            className="text-xs hover:text-[var(--primary)]"
+                          >
+                            ℹ️
+                          </button>
+                          {/* Edit (if mine) */}
+                          {mine && !message.deleted_at && (
+                            <button
+                              onClick={() => {
+                                setEditingMessageId(message.id);
+                                setDraft(message.content || "");
+                              }}
+                              title="Edit"
+                              className="text-xs hover:text-[var(--primary)]"
+                            >
+                              ✏️
+                            </button>
+                          )}
+                          {/* Delete (if mine or admin) */}
+                          {(mine || isUserAdmin) && !message.deleted_at && (
+                            <button
+                              onClick={() => void handleDeleteMessage(message.id)}
+                              title="Delete"
+                              className="text-xs hover:text-red-600"
+                            >
+                              🗑️
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Message Bubble */}
                         <div
                           className={`relative max-w-[85%] whitespace-pre-wrap break-words rounded-lg px-4 py-3 sm:max-w-[70%] ${
                             mine
@@ -927,13 +1180,32 @@ export default function ChatWorkspace() {
                               : "bg-[var(--background)]"
                           }`}
                         >
-                          {/* Show sender name in group chats if not mine */}
+                          {/* Sender name in group */}
                           {!mine && selected.type === "group" && (
                             <p className="mb-1 text-xs font-semibold text-[var(--primary)]">
                               {senderName}
                             </p>
                           )}
 
+                          {/* Quoted preview if reply */}
+                          {quoted && (
+                            <div
+                              className={`mb-2 rounded border-l-2 p-1.5 text-xs ${
+                                mine
+                                  ? "border-white/80 bg-black/15 text-white/90"
+                                  : "border-[var(--primary)] bg-black/5 text-[var(--muted)]"
+                              }`}
+                            >
+                              <span className="block font-semibold">
+                                {quotedSender}
+                              </span>
+                              <span className="block truncate">
+                                {quoted.content || "Message"}
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Content */}
                           {message.deleted_at ? (
                             <span className="italic text-xs opacity-75">
                               This message was deleted
@@ -942,7 +1214,20 @@ export default function ChatWorkspace() {
                             message.content || `[${message.message_type}]`
                           )}
 
-                          <div className="mt-1 flex items-center justify-end gap-2">
+                          {/* Footer: Star, Edited, Time, Read Status */}
+                          <div className="mt-1 flex items-center justify-end gap-1.5">
+                            {isStarred && (
+                              <span className="text-[10px] text-amber-300">⭐</span>
+                            )}
+                            {message.edited_at && (
+                              <span
+                                className={`text-[9px] ${
+                                  mine ? "text-white/60" : "text-[var(--muted)]"
+                                }`}
+                              >
+                                (edited)
+                              </span>
+                            )}
                             <span
                               className={`text-[10px] ${
                                 mine ? "text-white/70" : "text-[var(--muted)]"
@@ -957,17 +1242,53 @@ export default function ChatWorkspace() {
                               )}
                             </span>
 
-                            {/* Delete message icon for own message */}
-                            {mine && !message.deleted_at && (
-                              <button
-                                onClick={() => void handleDeleteMessage(message.id)}
-                                title="Delete message"
-                                className="opacity-0 transition-opacity group-hover:opacity-100 text-[11px] text-white/80 hover:text-white"
+                            {/* Read Receipt Checkmarks (for sender) */}
+                            {mine && (
+                              <span
+                                title={
+                                  hasRead
+                                    ? "Read"
+                                    : hasDelivered
+                                    ? "Delivered"
+                                    : "Sent"
+                                }
+                                className={`text-[10px] font-bold ${
+                                  hasRead
+                                    ? "text-sky-300"
+                                    : "text-white/70"
+                                }`}
                               >
-                                🗑️
-                              </button>
+                                {hasRead ? "✓✓" : hasDelivered ? "✓✓" : "✓"}
+                              </span>
                             )}
                           </div>
+
+                          {/* Reactions Badges */}
+                          {Object.keys(reactionCounts).length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {Object.entries(reactionCounts).map(
+                                ([emoji, { count, reactedByMe }]) => (
+                                  <button
+                                    key={emoji}
+                                    onClick={() =>
+                                      void handleToggleReaction(
+                                        message.id,
+                                        emoji
+                                      )
+                                    }
+                                    className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-xs transition border ${
+                                      reactedByMe
+                                        ? "border-white bg-white/20 text-white font-bold"
+                                        : "border-black/10 bg-black/5"
+                                    }`}
+                                  >
+                                    <span>{emoji}</span>
+                                    <span className="text-[10px]">{count}</span>
+                                  </button>
+                                )
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
                     );
@@ -976,7 +1297,7 @@ export default function ChatWorkspace() {
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* Scheduled Messages Banner (if any pending) */}
+              {/* Scheduled Messages Banner */}
               {conversationScheduledItems.length > 0 && (
                 <div className="border-t border-[var(--border)] bg-[var(--primary-soft)] px-4 py-2 text-xs text-[var(--primary)]">
                   <span className="font-semibold">
@@ -999,9 +1320,9 @@ export default function ChatWorkspace() {
                 </div>
               )}
 
-              {/* Realtime Typing Indicator */}
+              {/* Typing Indicator */}
               {activeTypingList.length > 0 && (
-                <div className="flex items-center gap-2 px-4 py-1.5 text-xs text-[var(--muted)]">
+                <div className="flex items-center gap-2 px-4 py-1 text-xs text-[var(--muted)]">
                   <div className="flex items-center gap-1">
                     <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)] [animation-delay:-0.3s]" />
                     <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--primary)] [animation-delay:-0.15s]" />
@@ -1014,10 +1335,79 @@ export default function ChatWorkspace() {
                 </div>
               )}
 
+              {/* Replying Banner */}
+              {replyingTo && (
+                <div className="flex items-center justify-between border-t border-[var(--border)] bg-[var(--primary-soft)] px-4 py-2 text-xs">
+                  <div className="min-w-0">
+                    <span className="font-semibold text-[var(--primary)]">
+                      Replying to {replyingTo.senderName}:
+                    </span>{" "}
+                    <span className="truncate italic text-[var(--foreground)]">
+                      &quot;{replyingTo.content}&quot;
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setReplyingTo(null)}
+                    className="font-bold text-[var(--muted)] hover:text-black"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Editing Banner */}
+              {editingMessageId && (
+                <div className="flex items-center justify-between border-t border-[var(--border)] bg-[var(--primary-soft)] px-4 py-2 text-xs">
+                  <span className="font-semibold text-[var(--primary)]">
+                    ✏️ Editing Message
+                  </span>
+                  <button
+                    onClick={() => {
+                      setEditingMessageId(null);
+                      setDraft("");
+                    }}
+                    className="font-semibold text-[var(--muted)] hover:text-black"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
               {error && (
                 <p role="alert" className="px-4 py-1 text-xs text-red-600">
                   {error}
                 </p>
+              )}
+
+              {/* Emoji Picker Popover */}
+              {showEmojiPicker && (
+                <div className="relative border-t border-[var(--border)] bg-[var(--surface)] p-2">
+                  <div className="flex items-center justify-between px-2 pb-1">
+                    <span className="text-xs font-semibold text-[var(--muted)]">
+                      Emoji Picker
+                    </span>
+                    <button
+                      onClick={() => setShowEmojiPicker(false)}
+                      className="text-xs text-[var(--muted)] hover:text-black"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-10 gap-1 p-1 max-h-32 overflow-y-auto">
+                    {EMOJI_PICKER_LIST.map((em) => (
+                      <button
+                        key={em}
+                        type="button"
+                        onClick={() => {
+                          setDraft((prev) => prev + em);
+                        }}
+                        className="text-lg hover:scale-125 transition p-1"
+                      >
+                        {em}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               )}
 
               {/* Composer */}
@@ -1025,6 +1415,16 @@ export default function ChatWorkspace() {
                 onSubmit={sendMessage}
                 className="flex items-end gap-2 border-t border-[var(--border)] p-3 sm:p-4"
               >
+                {/* Emoji toggle */}
+                <button
+                  type="button"
+                  title="Emoji"
+                  onClick={() => setShowEmojiPicker((prev) => !prev)}
+                  className="button-secondary shrink-0 px-2.5 py-2.5 text-base"
+                >
+                  😊
+                </button>
+
                 <textarea
                   value={draft}
                   onChange={(event) => handleDraftChange(event.target.value)}
@@ -1036,27 +1436,35 @@ export default function ChatWorkspace() {
                   }}
                   rows={1}
                   maxLength={5000}
-                  placeholder="Write a message…"
+                  placeholder={
+                    editingMessageId
+                      ? "Edit your message…"
+                      : replyingTo
+                      ? "Write a reply…"
+                      : "Write a message…"
+                  }
                   aria-label="Message"
                   className="max-h-32 min-h-11 flex-1 resize-y rounded-md border border-[var(--border)] bg-transparent px-3 py-3 text-sm outline-none focus:border-[var(--primary)]"
                 />
 
-                {/* Schedule button */}
-                <button
-                  type="button"
-                  title="Schedule message"
-                  disabled={!draft.trim()}
-                  onClick={() => setShowScheduleModal(true)}
-                  className="button-secondary shrink-0 px-3 py-2.5 text-sm disabled:opacity-40"
-                >
-                  ⏰
-                </button>
+                {/* Schedule */}
+                {!editingMessageId && (
+                  <button
+                    type="button"
+                    title="Schedule message"
+                    disabled={!draft.trim()}
+                    onClick={() => setShowScheduleModal(true)}
+                    className="button-secondary shrink-0 px-3 py-2.5 text-sm disabled:opacity-40"
+                  >
+                    ⏰
+                  </button>
+                )}
 
                 <button
                   disabled={sending || !draft.trim()}
                   className="button-primary shrink-0 disabled:opacity-50"
                 >
-                  {sending ? "Sending…" : "Send"}
+                  {sending ? "Sending…" : editingMessageId ? "Save" : "Send"}
                 </button>
               </form>
             </>
@@ -1142,7 +1550,6 @@ export default function ChatWorkspace() {
                 )}
               </div>
 
-              {/* Add member sub-view */}
               {showAddMembers && (
                 <div className="mt-2 rounded-md border border-[var(--border)] p-2">
                   <p className="text-xs text-[var(--muted)] mb-2">
@@ -1207,7 +1614,6 @@ export default function ChatWorkspace() {
                         </div>
                       </div>
 
-                      {/* Admin remove member button */}
                       {isUserAdmin && !isSelf && (
                         <button
                           onClick={() => void handleRemoveMember(mId)}
@@ -1287,6 +1693,66 @@ export default function ChatWorkspace() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 4. Modal: Message Info (Step 16) */}
+      {infoMessage && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-sm rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-xl">
+            <h2 className="text-lg font-bold tracking-tight">Message Info</h2>
+            <div className="mt-3 rounded border border-[var(--border)] bg-[var(--background)] p-3 text-xs">
+              <p className="font-semibold">{infoMessage.content}</p>
+              <p className="mt-1 text-[10px] text-[var(--muted)]">
+                Sent: {new Date(infoMessage.created_at).toLocaleString()}
+              </p>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+                Read Receipts
+              </h3>
+              {receipts.filter((rc) => rc.message_id === infoMessage.id).length === 0 ? (
+                <p className="text-xs text-[var(--muted)]">
+                  No read receipts recorded yet.
+                </p>
+              ) : (
+                <div className="space-y-2 max-h-40 overflow-y-auto">
+                  {receipts
+                    .filter((rc) => rc.message_id === infoMessage.id)
+                    .map((rc) => {
+                      const rcProfile = members[rc.user_id];
+                      return (
+                        <div
+                          key={rc.user_id}
+                          className="flex items-center justify-between text-xs"
+                        >
+                          <span className="font-medium">
+                            {rcProfile?.display_name || rcProfile?.username || "Recipient"}
+                          </span>
+                          <span className="text-[10px] text-sky-600 font-semibold">
+                            {rc.read_at
+                              ? `Read ${new Date(rc.read_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                              : rc.delivered_at
+                              ? "Delivered"
+                              : "Sent"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-5 flex justify-end">
+              <button
+                onClick={() => setInfoMessage(null)}
+                className="button-secondary text-xs"
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}
