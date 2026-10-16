@@ -25,9 +25,12 @@ import {
   CheckSquare,
   Trash2,
   Phone,
+  Video,
 } from "lucide-react";
 import VoiceCallModal from "@/components/voice-call-modal";
 import CallHistoryModal from "@/components/call-history-modal";
+import PublicProfileModal from "@/components/public-profile-modal";
+import { getSocket } from "@/lib/socket";
 
 type Profile = {
   id: string;
@@ -139,18 +142,24 @@ export default function ChatWorkspace() {
   const [infoMessage, setInfoMessage] = useState<Message | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 
-  // Voice Calling
+  // Public User Profile Modal
+  const [viewingProfileUserId, setViewingProfileUserId] = useState<string | null>(null);
+
+  // Voice / Video Calling
   const [isVoiceCallOpen, setIsVoiceCallOpen] = useState(false);
   const [isVoiceCallInitiator, setIsVoiceCallInitiator] = useState(false);
+  const [callType, setCallType] = useState<"audio" | "video">("audio");
   const [incomingOffer, setIncomingOffer] = useState<{
     callId: string;
     callerId: string;
     callerName: string;
-    sdp: RTCSessionDescriptionInit;
     conversationId: string;
+    type?: "audio" | "video";
   } | null>(null);
   const [activeCallConversationId, setActiveCallConversationId] = useState("");
   const [showCallHistory, setShowCallHistory] = useState(false);
+  const isVoiceCallOpenRef = useRef(false);
+  isVoiceCallOpenRef.current = isVoiceCallOpen;
 
   // Search input ref
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -188,9 +197,13 @@ export default function ChatWorkspace() {
 
       if (friendsError) throw friendsError;
 
-      const friendIds = (rows ?? []).map((r) =>
-        r.requester_id === uid ? r.addressee_id : r.requester_id
-      );
+      const friendIds = [
+        ...new Set(
+          (rows ?? []).map((r) =>
+            r.requester_id === uid ? r.addressee_id : r.requester_id
+          )
+        ),
+      ];
 
       if (friendIds.length === 0) {
         setAcceptedFriends([]);
@@ -246,10 +259,10 @@ export default function ChatWorkspace() {
         if (requestedId && list.some((item) => item.id === requestedId)) {
           return requestedId;
         }
-        if (list.some((item) => item.id === previous)) {
+        if (previous && list.some((item) => item.id === previous)) {
           return previous;
         }
-        return list[0]?.id ?? "";
+        return "";
       });
 
       const { data: allMembers, error: membersError } = await supabase
@@ -300,39 +313,73 @@ export default function ChatWorkspace() {
 
   useEffect(() => {
     const requestedId = searchParams.get("conversationId");
-    if (requestedId && conversations.some((item) => item.id === requestedId)) {
-      setSelectedId(requestedId);
+    if (requestedId) {
+      if (conversations.some((item) => item.id === requestedId)) {
+        setSelectedId(requestedId);
+      }
+    } else {
+      // Visiting /dashboard without a conversationId clears selection to show chat home
+      setSelectedId("");
     }
   }, [searchParams, conversations]);
 
-  // Listen for incoming voice calls for this user
+  const handleSelectConversation = useCallback(
+    (convId: string) => {
+      setSelectedId(convId);
+      router.push(`/dashboard?conversationId=${convId}`, { scroll: false });
+    },
+    [router]
+  );
+
+  const handleBackToChatList = useCallback(() => {
+    setSelectedId("");
+    router.push("/dashboard", { scroll: false });
+  }, [router]);
+
+  // Listen for incoming voice calls via singleton Socket.IO
   useEffect(() => {
     if (!userId) return;
 
-    const userCallChannel = supabase.channel(`user-calls-${userId}`, {
-      config: { broadcast: { self: false } },
+    let isMounted = true;
+    let socket: import("socket.io-client").Socket | null = null;
+    let incomingHandler: ((data: {
+      callId: string;
+      conversationId: string;
+      type: string;
+      caller: { id: string; name: string; avatarUrl?: string };
+    }) => void) | null = null;
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session?.access_token || !isMounted) return;
+
+      socket = getSocket(session.access_token);
+      if (!socket) return;
+
+      incomingHandler = (data) => {
+        if (isVoiceCallOpenRef.current) return; // already in a call
+        const type = (data.type === "video" ? "video" : "audio") as "audio" | "video";
+        setIncomingOffer({
+          callId: data.callId,
+          callerId: data.caller.id,
+          callerName: data.caller.name,
+          conversationId: data.conversationId,
+          type,
+        });
+        setCallType(type);
+        setActiveCallConversationId(data.conversationId);
+        setIsVoiceCallInitiator(false);
+        setIsVoiceCallOpen(true);
+      };
+
+      socket.off("call:incoming", incomingHandler);
+      socket.on("call:incoming", incomingHandler);
     });
 
-    userCallChannel
-      .on("broadcast", { event: "incoming_call" }, (payload) => {
-        const data = payload.payload;
-        if (data && data.callerId !== userId) {
-          setIncomingOffer({
-            callId: data.callId,
-            callerId: data.callerId,
-            callerName: data.callerName,
-            sdp: data.sdp,
-            conversationId: data.conversationId,
-          });
-          setActiveCallConversationId(data.conversationId);
-          setIsVoiceCallInitiator(false);
-          setIsVoiceCallOpen(true);
-        }
-      })
-      .subscribe();
-
     return () => {
-      supabase.removeChannel(userCallChannel);
+      isMounted = false;
+      if (socket && incomingHandler) {
+        socket.off("call:incoming", incomingHandler);
+      }
     };
   }, [userId]);
 
@@ -342,6 +389,20 @@ export default function ChatWorkspace() {
     const otherId = memberIds.find((id) => id !== userId);
     if (!otherId) return;
 
+    setCallType("audio");
+    setActiveCallConversationId(selected.id);
+    setIsVoiceCallInitiator(true);
+    setIncomingOffer(null);
+    setIsVoiceCallOpen(true);
+  }
+
+  function handleStartVideoCall() {
+    if (!selected || selected.type !== "direct") return;
+    const memberIds = conversationMembers[selected.id] ?? [];
+    const otherId = memberIds.find((id) => id !== userId);
+    if (!otherId) return;
+
+    setCallType("video");
     setActiveCallConversationId(selected.id);
     setIsVoiceCallInitiator(true);
     setIncomingOffer(null);
@@ -1143,11 +1204,20 @@ export default function ChatWorkspace() {
 
           <div className="flex flex-col items-center gap-4">
             <button
-              title="Profile"
+              title="Profile & Settings"
               onClick={() => router.push("/profile")}
-              className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)] ring-2 ring-transparent hover:ring-[var(--primary)] transition"
+              className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)] ring-2 ring-transparent hover:ring-[var(--primary)] transition overflow-hidden shadow-xs cursor-pointer"
             >
-              {(profile?.display_name || profile?.username || "U").slice(0, 1).toUpperCase()}
+              {profile?.avatar_url ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={profile.avatar_url}
+                  alt=""
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                (profile?.display_name || profile?.username || "U").slice(0, 1).toUpperCase()
+              )}
             </button>
             <button
               title="Log out"
@@ -1262,20 +1332,47 @@ export default function ChatWorkspace() {
                 return (
                   <button
                     key={conversation.id}
-                    onClick={() => setSelectedId(conversation.id)}
+                    onClick={() => handleSelectConversation(conversation.id)}
                     className={`mb-1 flex w-full items-center gap-3 rounded-xl p-3 text-left transition ${
                       isSelected
                         ? "bg-[var(--primary-soft)]"
                         : "hover:bg-[var(--background)]"
                     }`}
                   >
-                    <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)] shadow-inner">
-                      {conversation.type === "group" ? (
-                        <span>👥</span>
-                      ) : (
-                        name.slice(0, 1).toUpperCase()
-                      )}
-                    </span>
+                    {(() => {
+                      const memberIds = conversationMembers[conversation.id] ?? [];
+                      const otherId = memberIds.find((id) => id !== userId);
+                      const otherMember = otherId ? members[otherId] : undefined;
+                      const avatarUrl = conversation.type === "direct" ? otherMember?.avatar_url : null;
+
+                      return (
+                        <span
+                          onClick={(e) => {
+                            if (conversation.type === "direct" && otherId) {
+                              e.stopPropagation();
+                              setViewingProfileUserId(otherId);
+                            }
+                          }}
+                          title={conversation.type === "direct" ? "View profile" : undefined}
+                          className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)] shadow-inner overflow-hidden ${
+                            conversation.type === "direct" && otherId ? "hover:opacity-85 transition cursor-pointer" : ""
+                          }`}
+                        >
+                          {conversation.type === "group" ? (
+                            <span>👥</span>
+                          ) : avatarUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={avatarUrl}
+                              alt=""
+                              className="h-full w-full object-cover"
+                            />
+                          ) : (
+                            name.slice(0, 1).toUpperCase()
+                          )}
+                        </span>
+                      );
+                    })()}
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between">
                         <span className="truncate text-sm font-semibold">
@@ -1349,49 +1446,83 @@ export default function ChatWorkspace() {
                 <div
                   className="flex items-center gap-3 min-w-0 cursor-pointer"
                   onClick={() => {
-                    if (selected.type === "group") setShowGroupInfo(true);
+                    if (selected.type === "group") {
+                      setShowGroupInfo(true);
+                    } else {
+                      const memberIds = conversationMembers[selected.id] ?? [];
+                      const otherId = memberIds.find((id) => id !== userId);
+                      if (otherId) setViewingProfileUserId(otherId);
+                    }
                   }}
                 >
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      setSelectedId("");
+                      handleBackToChatList();
                     }}
                     className="mr-1 text-[var(--primary)] md:hidden"
                   >
                     <ArrowLeft size={18} />
                   </button>
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)]">
-                    {selected.type === "group" ? (
-                      <span>👥</span>
-                    ) : (
-                      conversationName(selected).slice(0, 1).toUpperCase()
-                    )}
-                  </div>
+                  {(() => {
+                    const memberIds = conversationMembers[selected.id] ?? [];
+                    const otherId = memberIds.find((id) => id !== userId);
+                    const otherMember = otherId ? members[otherId] : undefined;
+                    const avatarUrl = selected.type === "direct" ? otherMember?.avatar_url : null;
+
+                    return (
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--primary)] overflow-hidden shadow-xs">
+                        {selected.type === "group" ? (
+                          <span>👥</span>
+                        ) : avatarUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={avatarUrl}
+                            alt=""
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          conversationName(selected).slice(0, 1).toUpperCase()
+                        )}
+                      </div>
+                    );
+                  })()}
                   <div className="min-w-0">
-                    <h2 className="truncate font-semibold text-sm">
+                    <h2 className="truncate font-semibold text-sm hover:underline">
                       {conversationName(selected)}
                     </h2>
                     <p className="text-xs text-[var(--muted)]">
                       {selected.type === "group"
                         ? `${selectedConversationMemberIds.length} members`
-                        : "Online"}
+                        : "Click to view profile"}
                     </p>
                   </div>
                 </div>
 
                 <div className="flex items-center gap-2">
                   {selected.type === "direct" && (
-                    <button
-                      id="direct-call-button"
-                      onClick={handleStartVoiceCall}
-                      className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-hover)] px-2.5 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--primary)] hover:text-white transition-colors cursor-pointer"
-                      title="Audio Call"
-                      aria-label="Start Voice Call"
-                    >
-                      <Phone size={15} />
-                      <span className="hidden sm:inline">Call</span>
-                    </button>
+                    <>
+                      <button
+                        id="direct-call-button"
+                        onClick={handleStartVoiceCall}
+                        className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-hover)] px-2.5 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--primary)] hover:text-white transition-colors cursor-pointer"
+                        title="Voice Call"
+                        aria-label="Start Voice Call"
+                      >
+                        <Phone size={15} />
+                        <span className="hidden sm:inline">Call</span>
+                      </button>
+                      <button
+                        id="direct-video-call-button"
+                        onClick={handleStartVideoCall}
+                        className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-hover)] px-2.5 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--primary)] hover:text-white transition-colors cursor-pointer"
+                        title="Video Call"
+                        aria-label="Start Video Call"
+                      >
+                        <Video size={15} />
+                        <span className="hidden sm:inline">Video</span>
+                      </button>
+                    </>
                   )}
                   {selected.type === "group" && (
                     <button
@@ -1615,9 +1746,16 @@ export default function ChatWorkspace() {
                         >
                           {/* Sender name in group chats */}
                           {!mine && selected.type === "group" && (
-                            <p className="mb-1 text-xs font-semibold text-[var(--primary)]">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setViewingProfileUserId(message.sender_id);
+                              }}
+                              className="mb-1 block text-xs font-semibold text-[var(--primary)] hover:underline text-left cursor-pointer"
+                            >
                               {senderName}
-                            </p>
+                            </button>
                           )}
 
                           {/* Quoted Reply Block */}
@@ -2064,14 +2202,27 @@ export default function ChatWorkspace() {
                       key={mId}
                       className="flex items-center justify-between rounded-lg p-2 text-sm hover:bg-[var(--background)] transition"
                     >
-                      <div className="flex items-center gap-2.5">
-                        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)]">
-                          {(mProfile?.display_name || mProfile?.username || "U")
-                            .slice(0, 1)
-                            .toUpperCase()}
+                      <div
+                        className="flex items-center gap-2.5 cursor-pointer"
+                        onClick={() => setViewingProfileUserId(mId)}
+                        title="View profile"
+                      >
+                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--primary-soft)] text-xs font-bold text-[var(--primary)] overflow-hidden">
+                          {mProfile?.avatar_url ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={mProfile.avatar_url}
+                              alt=""
+                              className="h-full w-full object-cover"
+                            />
+                          ) : (
+                            (mProfile?.display_name || mProfile?.username || "U")
+                              .slice(0, 1)
+                              .toUpperCase()
+                          )}
                         </span>
                         <div>
-                          <p className="font-semibold text-xs leading-4">
+                          <p className="font-semibold text-xs leading-4 hover:underline">
                             {mProfile?.display_name || mProfile?.username || "Member"}{" "}
                             {isSelf && "(You)"}
                           </p>
@@ -2229,9 +2380,10 @@ export default function ChatWorkspace() {
         <CallHistoryModal
           currentUserId={userId}
           onClose={() => setShowCallHistory(false)}
-          onInitiateCall={(convId, contactId) => {
+          onInitiateCall={(convId, contactId, type = "audio") => {
             setShowCallHistory(false);
             setActiveCallConversationId(convId);
+            setCallType(type);
             setIsVoiceCallInitiator(true);
             setIncomingOffer(null);
             setIsVoiceCallOpen(true);
@@ -2239,7 +2391,7 @@ export default function ChatWorkspace() {
         />
       )}
 
-      {/* Voice Call Modal */}
+      {/* Voice & Video Call Modal */}
       {isVoiceCallOpen && activeCallConversationId && (
         <VoiceCallModal
           currentUserId={userId}
@@ -2263,11 +2415,37 @@ export default function ChatWorkspace() {
             })()
           }
           isInitiator={isVoiceCallInitiator}
-          incomingOfferData={incomingOffer}
+          callType={callType}
+          incomingCallData={incomingOffer}
           onClose={() => {
             setIsVoiceCallOpen(false);
             setIncomingOffer(null);
             setActiveCallConversationId("");
+          }}
+        />
+      )}
+
+      {/* 5. Modal: Public User Profile */}
+      {viewingProfileUserId && (
+        <PublicProfileModal
+          targetUserId={viewingProfileUserId}
+          currentUserId={userId}
+          onClose={() => setViewingProfileUserId(null)}
+          onOpenDirectChat={(friendId) => {
+            setViewingProfileUserId(null);
+            void (async () => {
+              try {
+                const { data: convId } = await supabase.rpc(
+                  "get_or_create_direct_conversation",
+                  { p_friend_id: friendId }
+                );
+                if (convId) {
+                  handleSelectConversation(convId);
+                }
+              } catch {
+                // handled
+              }
+            })();
           }}
         />
       )}

@@ -6,6 +6,8 @@ import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
 import { setupSocketServer } from "./socket.js";
 
+import { getIceConfigHandler } from "./ice.js";
+
 const app = express();
 const server = http.createServer(app);
 const PORT = Number(process.env.PORT ?? 4000);
@@ -38,6 +40,9 @@ app.get("/api/health", (_req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// ICE Servers & TURN credentials config endpoint (Blueprint Phase 3)
+app.get("/api/calls/ice-config", getIceConfigHandler);
 
 // Setup Socket.IO Server on the same HTTP server
 setupSocketServer(server, WEB_ORIGIN);

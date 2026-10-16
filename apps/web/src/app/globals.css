@@ -3,6 +3,7 @@
 :root {
   --background: #f7f7f4;
   --surface: #ffffff;
+  --surface-hover: #f1f4ee;
   --foreground: #252925;
   --muted: #686f68;
   --border: #e1e4dd;
@@ -10,6 +11,59 @@
   --primary-hover: #1d5949;
   --primary-soft: #e8efe9;
   --focus: #246b58;
+  --danger: #dc2626;
+  --danger-soft: #fee2e2;
+  --danger-hover: #b91c1c;
+}
+
+[data-theme="light"] {
+  --background: #f7f7f4;
+  --surface: #ffffff;
+  --surface-hover: #f1f4ee;
+  --foreground: #252925;
+  --muted: #686f68;
+  --border: #e1e4dd;
+  --primary: #246b58;
+  --primary-hover: #1d5949;
+  --primary-soft: #e8efe9;
+  --focus: #246b58;
+  --danger: #dc2626;
+  --danger-soft: #fee2e2;
+  --danger-hover: #b91c1c;
+}
+
+[data-theme="dark"] {
+  --background: #0f1412;
+  --surface: #18201c;
+  --surface-hover: #212c27;
+  --foreground: #f0f4f1;
+  --muted: #95a39a;
+  --border: #28362f;
+  --primary: #2ea886;
+  --primary-hover: #38c49e;
+  --primary-soft: #19332a;
+  --focus: #38c49e;
+  --danger: #ef4444;
+  --danger-soft: #381a1a;
+  --danger-hover: #dc2626;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]):not([data-theme="dark"]) {
+    --background: #0f1412;
+    --surface: #18201c;
+    --surface-hover: #212c27;
+    --foreground: #f0f4f1;
+    --muted: #95a39a;
+    --border: #28362f;
+    --primary: #2ea886;
+    --primary-hover: #38c49e;
+    --primary-soft: #19332a;
+    --focus: #38c49e;
+    --danger: #ef4444;
+    --danger-soft: #381a1a;
+    --danger-hover: #dc2626;
+  }
 }
 
 @theme inline {
@@ -137,7 +191,27 @@ textarea:focus-visible {
 }
 
 .button-secondary:hover {
-  border-color: #b8c4ba;
+  background: var(--surface-hover);
+  border-color: var(--primary);
+}
+
+.button-danger {
+  display: inline-flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 22px;
+  border: 1px solid var(--danger);
+  border-radius: 5px;
+  background: var(--danger);
+  color: white;
+  font-size: 0.94rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.button-danger:hover {
+  background: var(--danger-hover);
 }
 
 @media (max-width: 640px) {

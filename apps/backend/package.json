@@ -8,7 +8,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/calling.test.ts"
+    "test": "tsx --test src/calling.test.ts src/profile.test.ts"
   },
   "dependencies": {
     "@types/pg": "^8.23.1",
@@ -18,7 +18,8 @@
     "express-rate-limit": "^8.7.1",
     "helmet": "8.1.0",
     "pg": "^8.23.1",
-    "socket.io": "^4.8.4"
+    "socket.io": "^4.8.4",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/cors": "2.8.19",

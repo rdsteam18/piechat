@@ -55,10 +55,14 @@ create table if not exists public.messages (
   created_at timestamptz not null default now()
 );
 
--- Indexes for performance
+-- Indexes for performance & integrity
 create index if not exists messages_conversation_created_idx on public.messages (conversation_id, created_at desc);
 create index if not exists friendships_addressee_status_idx on public.friendships (addressee_id, status);
 create index if not exists conversation_members_user_idx on public.conversation_members (user_id);
+create unique index if not exists friendships_pairwise_unique_idx on public.friendships (
+  least(requester_id, addressee_id),
+  greatest(requester_id, addressee_id)
+);
 
 -- Enable Row Level Security (RLS) on all tables
 alter table public.profiles enable row level security;
@@ -898,7 +902,7 @@ create table if not exists public.calls (
   conversation_id uuid not null references public.conversations(id) on delete cascade,
   caller_id uuid not null references public.profiles(id) on delete cascade,
   recipient_id uuid not null references public.profiles(id) on delete cascade,
-  status text not null default 'ringing' check (status in ('ringing', 'accepted', 'rejected', 'busy', 'cancelled', 'missed', 'failed', 'ended')),
+  status text not null default 'ringing' check (status in ('ringing', 'accepted', 'connected', 'declined', 'missed', 'cancelled', 'busy', 'failed', 'ended')),
   started_at timestamptz,
   ended_at timestamptz,
   duration integer not null default 0,
@@ -938,5 +942,122 @@ with check (
 
 alter table public.calls replica identity full;
 alter publication supabase_realtime add table public.calls;
+
+-- ========================================================
+-- STEP 22: User Privacy & Blocking RPCs
+-- ========================================================
+
+create or replace function public.block_user(p_target_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_friendship_id uuid;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+  if v_user_id = p_target_user_id then
+    raise exception 'Cannot block yourself';
+  end if;
+
+  select id into v_friendship_id
+  from public.friendships
+  where (requester_id = v_user_id and addressee_id = p_target_user_id)
+     or (requester_id = p_target_user_id and addressee_id = v_user_id)
+  limit 1;
+
+  if v_friendship_id is not null then
+    update public.friendships
+    set requester_id = v_user_id,
+        addressee_id = p_target_user_id,
+        status = 'blocked'
+    where id = v_friendship_id;
+  else
+    insert into public.friendships (requester_id, addressee_id, status)
+    values (v_user_id, p_target_user_id, 'blocked');
+  end if;
+end;
+$$;
+
+create or replace function public.unblock_user(p_target_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  delete from public.friendships
+  where requester_id = v_user_id
+    and addressee_id = p_target_user_id
+    and status = 'blocked';
+end;
+$$;
+
+revoke all on function public.block_user(uuid) from public, anon;
+grant execute on function public.block_user(uuid) to authenticated;
+
+revoke all on function public.unblock_user(uuid) from public, anon;
+grant execute on function public.unblock_user(uuid) to authenticated;
+
+create or replace function public.remove_friend(p_friend_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user_id uuid := auth.uid();
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  delete from public.friendships
+  where status = 'accepted'
+    and (
+      (requester_id = v_user_id and addressee_id = p_friend_id)
+      or (requester_id = p_friend_id and addressee_id = v_user_id)
+    );
+end;
+$$;
+
+revoke all on function public.remove_friend(uuid) from public, anon;
+grant execute on function public.remove_friend(uuid) to authenticated;
+
+-- 6. Calls (1:1 Audio and Video Calling History)
+create table if not exists public.calls (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  caller_id uuid not null references public.profiles(id) on delete cascade,
+  recipient_id uuid not null references public.profiles(id) on delete cascade,
+  type text not null default 'audio' check (type in ('audio', 'video')),
+  status text not null check (status in ('ringing', 'connecting', 'connected', 'ended')),
+  started_at timestamptz,
+  ended_at timestamptz,
+  duration integer not null default 0,
+  end_reason text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists calls_conversation_created_idx on public.calls (conversation_id, created_at desc);
+create index if not exists calls_caller_recipient_idx on public.calls (caller_id, recipient_id, created_at desc);
+
+-- RLS: Only participants of the call can view their call history
+alter table public.calls enable row level security;
+
+create policy "Users can view their own call records"
+  on public.calls for select
+  using (auth.uid() = caller_id or auth.uid() = recipient_id);
+
 
 

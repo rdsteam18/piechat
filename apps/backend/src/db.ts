@@ -83,37 +83,162 @@ export async function verifyDirectConversationMembership(
   }
 }
 
+/**
+ * Derives the recipient (other member) of a direct conversation from the DB.
+ * Never trusts a client-provided recipientId.
+ * Returns null if the conversation is not direct, doesn't exist, or
+ * the caller is not a member.
+ */
+export async function getDirectConversationRecipient(
+  conversationId: string,
+  callerId: string
+): Promise<string | null> {
+  try {
+    const client = await pool.connect();
+    try {
+      // Fetch all members of this conversation; must be a direct conv with exactly 2 members
+      const res = await client.query(
+        `select c.type, cm.user_id
+         from public.conversations c
+         join public.conversation_members cm on cm.conversation_id = c.id
+         where c.id = $1 and c.type = 'direct'`,
+        [conversationId]
+      );
+
+      if (res.rows.length === 0) return null; // Not a direct conversation
+
+      const memberIds: string[] = res.rows.map((r: { user_id: string }) => r.user_id);
+      if (!memberIds.includes(callerId)) return null; // Caller is not a member
+
+      const recipient = memberIds.find((id) => id !== callerId) ?? null;
+      return recipient;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("getDirectConversationRecipient DB error:", err);
+    // Supabase fallback
+    try {
+      const { data: conv } = await supabase
+        .from("conversations")
+        .select("type")
+        .eq("id", conversationId)
+        .single();
+      if (!conv || conv.type !== "direct") return null;
+
+      const { data: members } = await supabase
+        .from("conversation_members")
+        .select("user_id")
+        .eq("conversation_id", conversationId);
+
+      if (!members || members.length === 0) return null;
+      const memberIds = members.map((m: { user_id: string }) => m.user_id);
+      if (!memberIds.includes(callerId)) return null;
+      return memberIds.find((id: string) => id !== callerId) ?? null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+const profileCache = new Map<
+  string,
+  { profile: { username: string; display_name: string; avatar_url: string | null }; ts: number }
+>();
+const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Fetches the caller's display profile with in-memory caching and direct Postgres query
+ * to ensure zero latency on the fast call-notification path.
+ */
+export async function getCallerProfile(
+  userId: string
+): Promise<{ username: string; display_name: string; avatar_url: string | null }> {
+  const cached = profileCache.get(userId);
+  if (cached && Date.now() - cached.ts < PROFILE_CACHE_TTL_MS) {
+    return cached.profile;
+  }
+
+  const fallback = { username: "User", display_name: "PieChat User", avatar_url: null };
+
+  try {
+    const client = await pool.connect();
+    try {
+      const res = await client.query(
+        "select username, display_name, avatar_url from public.profiles where id = $1 limit 1",
+        [userId]
+      );
+      if (res.rows.length > 0) {
+        const p = res.rows[0];
+        const profile = {
+          username: p.username || "User",
+          display_name: p.display_name || p.username || "PieChat User",
+          avatar_url: p.avatar_url ?? null,
+        };
+        profileCache.set(userId, { profile, ts: Date.now() });
+        return profile;
+      }
+    } finally {
+      client.release();
+    }
+  } catch {
+    // Supabase fallback
+    try {
+      const { data } = await supabase
+        .from("profiles")
+        .select("username, display_name, avatar_url")
+        .eq("id", userId)
+        .single();
+      if (data) {
+        const profile = data as { username: string; display_name: string; avatar_url: string | null };
+        profileCache.set(userId, { profile, ts: Date.now() });
+        return profile;
+      }
+    } catch {
+      // return fallback
+    }
+  }
+
+  return fallback;
+}
+
 export async function saveCallRecord(record: {
   id: string;
   conversation_id: string;
   caller_id: string;
   recipient_id: string;
+  type?: "audio" | "video";
   status: string;
   started_at?: string | null;
   ended_at?: string | null;
   duration?: number;
   end_reason?: string | null;
 }) {
+  const callType = record.type ?? "audio";
   try {
     const client = await pool.connect();
     try {
       await client.query(
-        `insert into public.calls (id, conversation_id, caller_id, recipient_id, status, started_at, ended_at, duration)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)
+        `insert into public.calls (id, conversation_id, caller_id, recipient_id, type, status, started_at, ended_at, duration, end_reason)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          on conflict (id) do update set
+           type = coalesce(public.calls.type, excluded.type),
            status = excluded.status,
            started_at = coalesce(public.calls.started_at, excluded.started_at),
            ended_at = excluded.ended_at,
-           duration = excluded.duration`,
+           duration = excluded.duration,
+           end_reason = coalesce(excluded.end_reason, public.calls.end_reason)`,
         [
           record.id,
           record.conversation_id,
           record.caller_id,
           record.recipient_id,
+          callType,
           record.status,
           record.started_at ?? null,
           record.ended_at ?? null,
           record.duration ?? 0,
+          record.end_reason ?? null,
         ]
       );
     } finally {
@@ -127,10 +252,12 @@ export async function saveCallRecord(record: {
         conversation_id: record.conversation_id,
         caller_id: record.caller_id,
         recipient_id: record.recipient_id,
+        type: callType,
         status: record.status,
         started_at: record.started_at,
         ended_at: record.ended_at,
         duration: record.duration ?? 0,
+        end_reason: record.end_reason,
       });
     } catch (fallbackErr) {
       console.warn("Supabase upsert call fallback also failed:", fallbackErr);

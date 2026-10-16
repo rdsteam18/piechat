@@ -23,5 +23,8 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.3"
+  },
+  "overrides": {
+    "braces": "^3.0.3"
   }
 }

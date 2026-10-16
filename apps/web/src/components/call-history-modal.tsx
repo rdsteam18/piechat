@@ -7,6 +7,7 @@ import {
   PhoneIncoming,
   PhoneOutgoing,
   PhoneMissed,
+  Video,
   X,
   Clock,
   RefreshCw,
@@ -17,6 +18,7 @@ export type CallHistoryItem = {
   conversation_id: string;
   caller_id: string;
   recipient_id: string;
+  type?: "audio" | "video";
   status: string;
   started_at: string | null;
   ended_at: string | null;
@@ -29,7 +31,7 @@ export type CallHistoryItem = {
 interface CallHistoryModalProps {
   currentUserId: string;
   onClose: () => void;
-  onInitiateCall: (conversationId: string, recipientId: string) => void;
+  onInitiateCall: (conversationId: string, recipientId: string, type?: "audio" | "video") => void;
 }
 
 export default function CallHistoryModal({
@@ -144,7 +146,7 @@ export default function CallHistoryModal({
                 Call History
               </h2>
               <p className="text-xs text-[var(--muted)]">
-                Your recent one-to-one voice calls
+                Your recent one-to-one voice & video calls
               </p>
             </div>
           </div>
@@ -214,6 +216,15 @@ export default function CallHistoryModal({
                         <span className="font-medium text-sm truncate text-[var(--foreground)]">
                           {call.contactName}
                         </span>
+                        {call.type === "video" ? (
+                          <span className="inline-flex items-center gap-1 rounded bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium text-indigo-400">
+                            <Video size={10} /> Video
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+                            <Phone size={10} /> Voice
+                          </span>
+                        )}
                         {isOutgoing ? (
                           <PhoneOutgoing
                             size={13}
@@ -256,20 +267,38 @@ export default function CallHistoryModal({
                     </div>
                   </div>
 
-                  <button
-                    onClick={() => {
-                      const contactId =
-                        call.caller_id === currentUserId
-                          ? call.recipient_id
-                          : call.caller_id;
-                      onClose();
-                      onInitiateCall(call.conversation_id, contactId);
-                    }}
-                    title="Call Back"
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--primary)] hover:bg-[var(--primary)] hover:text-white transition-colors ml-2"
-                  >
-                    <Phone size={15} />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0 ml-2">
+                    <button
+                      onClick={() => {
+                        const contactId =
+                          call.caller_id === currentUserId
+                            ? call.recipient_id
+                            : call.caller_id;
+                        onClose();
+                        onInitiateCall(call.conversation_id, contactId, "audio");
+                      }}
+                      title="Voice Call Back"
+                      aria-label="Voice Call Back"
+                      className="flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--primary)] hover:text-white transition-colors cursor-pointer"
+                    >
+                      <Phone size={14} />
+                    </button>
+                    <button
+                      onClick={() => {
+                        const contactId =
+                          call.caller_id === currentUserId
+                            ? call.recipient_id
+                            : call.caller_id;
+                        onClose();
+                        onInitiateCall(call.conversation_id, contactId, "video");
+                      }}
+                      title="Video Call Back"
+                      aria-label="Video Call Back"
+                      className="flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--primary)] hover:text-white transition-colors cursor-pointer"
+                    >
+                      <Video size={14} />
+                    </button>
+                  </div>
                 </div>
               );
             })
