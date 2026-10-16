@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabase";
+import { supabase, getValidSession } from "@/lib/supabase";
 import {
   validateUsername,
   validateDisplayName,
@@ -127,19 +127,15 @@ export default function ProfilePage() {
       setLoading(true);
       setStatusMessage(null);
 
-      let authUser: { id: string; email?: string } | null = null;
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (sessionData.session?.user) {
-        authUser = sessionData.session.user;
-      } else {
-        const { data: authData } = await supabase.auth.getUser();
-        if (authData?.user) authUser = authData.user;
-      }
+      const session = await getValidSession();
+      if (!active) return;
 
-      if (!authUser) {
+      if (!session?.user) {
         router.replace("/auth");
         return;
       }
+
+      const authUser = session.user;
 
       if (!active) return;
       setUserId(authUser.id);
@@ -211,8 +207,18 @@ export default function ProfilePage() {
 
     void loadUserAndProfile();
 
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (!active) return;
+      if (event === "SIGNED_OUT") {
+        router.replace("/auth");
+      }
+    });
+
     return () => {
       active = false;
+      subscription.unsubscribe();
     };
   }, [router]);
 

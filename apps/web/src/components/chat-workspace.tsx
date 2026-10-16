@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { supabase } from "@/lib/supabase";
+import { supabase, getValidSession } from "@/lib/supabase";
 import CreateGroupDialog from "@/components/create-group-dialog";
 import MessageActionMenu, { MessageAction } from "@/components/message-action-menu";
 import { checkMessageEditEligibility } from "@/lib/message-actions";
@@ -30,7 +30,7 @@ import {
 import VoiceCallModal from "@/components/voice-call-modal";
 import CallHistoryModal from "@/components/call-history-modal";
 import PublicProfileModal from "@/components/public-profile-modal";
-import { getSocket } from "@/lib/socket";
+import { getSocket, disconnectSocket } from "@/lib/socket";
 
 type Profile = {
   id: string;
@@ -482,25 +482,15 @@ export default function ChatWorkspace() {
 
     async function initialize() {
       try {
-        let authUser: { id: string } | null = null;
+        const session = await getValidSession();
+        if (!active) return;
 
-        const { data: sessionData } = await supabase.auth.getSession();
-        if (sessionData.session?.user) {
-          authUser = sessionData.session.user;
-        } else {
-          const { data: userData, error: authError } =
-            await supabase.auth.getUser();
-          if (!authError && userData?.user) {
-            authUser = userData.user;
-          }
-        }
-
-        if (!authUser) {
+        if (!session?.user) {
           router.replace("/auth");
           return;
         }
 
-        if (!active) return;
+        const authUser = session.user;
         setUserId(authUser.id);
 
         const { data: ownProfile, error: profileError } = await supabase
@@ -530,8 +520,9 @@ export default function ChatWorkspace() {
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === "SIGNED_OUT" || (!session && event !== "INITIAL_SESSION")) {
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (!active) return;
+      if (event === "SIGNED_OUT") {
         router.replace("/auth");
       }
     });
@@ -1222,6 +1213,7 @@ export default function ChatWorkspace() {
             <button
               title="Log out"
               onClick={async () => {
+                disconnectSocket();
                 await supabase.auth.signOut();
                 router.replace("/auth");
                 router.refresh();

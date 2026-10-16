@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabase";
+import { supabase, getValidSession } from "@/lib/supabase";
 
 type OAuthProvider = "google" | "github" | "linkedin_oidc" | "facebook";
 
@@ -21,18 +21,28 @@ export default function AuthPage() {
   useEffect(() => {
     let active = true;
 
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session && active) {
+    async function checkAuth() {
+      const session = await getValidSession();
+      if (!active) return;
+      if (session) {
         router.replace("/dashboard");
-      } else if (active) {
+      } else {
         setChecking(false);
       }
-    });
+    }
+
+    void checkAuth();
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (session && active) {
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!active) return;
+      if (
+        session &&
+        (event === "SIGNED_IN" ||
+          event === "INITIAL_SESSION" ||
+          event === "TOKEN_REFRESHED")
+      ) {
         router.replace("/dashboard");
       }
     });

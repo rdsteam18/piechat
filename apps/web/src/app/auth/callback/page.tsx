@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabase";
+import { supabase, getValidSession } from "@/lib/supabase";
 
 export default function AuthCallbackPage() {
   const router = useRouter();
@@ -21,12 +21,10 @@ export default function AuthCallbackPage() {
             await supabase.auth.exchangeCodeForSession(code);
           if (exchangeError) throw exchangeError;
         } else {
-          // Check if session is already active (implicit flow / tokens in hash)
-          const { data, error: sessionError } =
-            await supabase.auth.getSession();
-          if (sessionError) throw sessionError;
+          // Check if session is already active (implicit flow / tokens in hash / refresh)
+          const session = await getValidSession();
 
-          if (!data.session) {
+          if (!session) {
             // Listen once for auth state change
             const { data: authListener } = supabase.auth.onAuthStateChange(
               (event, session) => {

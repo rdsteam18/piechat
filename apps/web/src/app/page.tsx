@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { PublicFooter, PublicHeader } from "@/components/public-site";
-import { supabase } from "@/lib/supabase";
+import { supabase, getValidSession } from "@/lib/supabase";
 
 const features = [
   {
@@ -52,16 +52,35 @@ export default function HomePage() {
   useEffect(() => {
     let active = true;
 
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session && active) {
+    async function checkSession() {
+      const session = await getValidSession();
+      if (!active) return;
+      if (session) {
         router.replace("/dashboard");
-      } else if (active) {
+      } else {
         setChecking(false);
+      }
+    }
+
+    void checkSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!active) return;
+      if (
+        session &&
+        (event === "SIGNED_IN" ||
+          event === "INITIAL_SESSION" ||
+          event === "TOKEN_REFRESHED")
+      ) {
+        router.replace("/dashboard");
       }
     });
 
     return () => {
       active = false;
+      subscription.unsubscribe();
     };
   }, [router]);
 

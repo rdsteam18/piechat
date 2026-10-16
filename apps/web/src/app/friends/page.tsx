@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabase";
+import { supabase, getValidSession } from "@/lib/supabase";
 import PublicProfileModal from "@/components/public-profile-modal";
 import {
   Users,
@@ -169,32 +169,33 @@ export default function FriendsPage() {
 
     async function initialize() {
       setLoadingInitial(true);
-      let authUser: { id: string } | null = null;
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (sessionData.session?.user) {
-        authUser = sessionData.session.user;
-      } else {
-        const { data: userData } = await supabase.auth.getUser();
-        if (userData?.user) {
-          authUser = userData.user;
-        }
-      }
+      const session = await getValidSession();
+      if (!active) return;
 
-      if (!authUser) {
+      if (!session?.user) {
         router.replace("/auth");
         return;
       }
 
-      if (!active) return;
-      setUserId(authUser.id);
-      await loadData(authUser.id);
+      setUserId(session.user.id);
+      await loadData(session.user.id);
       if (active) setLoadingInitial(false);
     }
 
     void initialize();
 
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (!active) return;
+      if (event === "SIGNED_OUT") {
+        router.replace("/auth");
+      }
+    });
+
     return () => {
       active = false;
+      subscription.unsubscribe();
     };
   }, [loadData, router]);
 
